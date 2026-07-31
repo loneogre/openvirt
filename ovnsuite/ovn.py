@@ -9,6 +9,7 @@ visible in the --dry-run listing exactly as the shell version printed them.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 
 from .context import Ctx
 
@@ -123,6 +124,92 @@ def pg_members(ctx: Ctx, name: str) -> list[str]:
     out = ctx.qout("ovn-nbctl", "--bare", "--columns=ports", "list",
                    "Port_Group", name)
     return out.split()
+
+
+@dataclass(frozen=True)
+class Acl:
+    """One row of the ACL table."""
+
+    direction: str
+    priority: str
+    action: str
+    match: str
+
+
+@dataclass
+class PortGroup:
+    """A Port_Group row with its references already resolved."""
+
+    name: str
+    ports: list[str]          # logical switch port NAMES, not row uuids
+    acls: list[Acl]
+
+
+def _uuid_list(value) -> list[str]:
+    """An ovsdb reference column -- one uuid or a set of them -- as ids."""
+    if isinstance(value, list) and len(value) == 2:
+        if value[0] == "uuid":
+            return [str(value[1])]
+        if value[0] == "set":
+            return [str(v[1]) for v in value[1]
+                    if isinstance(v, list) and len(v) == 2 and v[0] == "uuid"]
+    return []
+
+
+def pg_snapshot(ctx: Ctx) -> dict[str, PortGroup]:
+    """Every port group in the NB db, members and ACLs resolved.
+
+    Four queries regardless of how many groups exist, rather than three per
+    group. 'ports' and 'acls' are fetched separately on purpose: show.py
+    records that asking for both reference columns at once returned
+    unreliable results for one of them, and a silently short member list
+    would read as drift that isn't there.
+
+    Port_Group.ports holds row uuids; they are translated back to logical
+    port names here because that is what the inventory and the yaml speak.
+    """
+    ports_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", "--columns=name,ports",
+                 "list", "Port_Group"), "name,ports")
+    acls_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", "--columns=name,acls",
+                 "list", "Port_Group"), "name,acls")
+    acl_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json",
+                 "--columns=_uuid,direction,priority,action,match", "list",
+                 "ACL"), "_uuid,direction,priority,action,match")
+    lsp_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", "--columns=_uuid,name", "list",
+                 "Logical_Switch_Port"), "_uuid,name")
+
+    lsp_name = {u: str(row[1]) for row in lsp_rows if len(row) >= 2
+                for u in _uuid_list(row[0])}
+    acl_by_uuid: dict[str, Acl] = {}
+    for row in acl_rows:
+        if len(row) < 5:
+            continue
+        for u in _uuid_list(row[0]):
+            acl_by_uuid[u] = Acl(str(row[1] or ""), str(row[2]),
+                                 str(row[3] or ""), str(row[4] or ""))
+
+    acls_of = {str(row[0]): _uuid_list(row[1])
+               for row in acls_rows if len(row) >= 2}
+
+    groups: dict[str, PortGroup] = {}
+    for row in ports_rows:
+        if len(row) < 2:
+            continue
+        name = str(row[0])
+        # An unresolvable member uuid is kept as the raw id rather than
+        # dropped: a port group pointing at a deleted port is a real fault
+        # and hiding it would make the group look correct.
+        groups[name] = PortGroup(
+            name=name,
+            ports=[lsp_name.get(u, u) for u in _uuid_list(row[1])],
+            acls=[acl_by_uuid[u] for u in acls_of.get(name, [])
+                  if u in acl_by_uuid],
+        )
+    return groups
 
 
 def acl_list(ctx: Ctx, target: str) -> list[str]:

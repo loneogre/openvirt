@@ -45,6 +45,25 @@ def format_cmd(argv: list[str]) -> str:
     return " ".join(shquote(str(a)) for a in argv)
 
 
+class Colour:
+    """ANSI codes, but only when stdout is a terminal and NO_COLOR is unset.
+
+    `ovnctl --no-color` exports NO_COLOR before the subcommand runs, so
+    honouring the variable covers the flag too, and a redirected run
+    (`ovnctl acl --audit > report.txt`) stays plain text without anyone
+    having to remember the flag.
+    """
+
+    def __init__(self) -> None:
+        enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        self.red = "\033[31m" if enabled else ""
+        self.grn = "\033[32m" if enabled else ""
+        self.ylw = "\033[33m" if enabled else ""
+        self.dim = "\033[2m" if enabled else ""
+        self.bold = "\033[1m" if enabled else ""
+        self.rst = "\033[0m" if enabled else ""
+
+
 class Abort(Exception):
     """Fatal error -- message already formatted, exit non-zero."""
 

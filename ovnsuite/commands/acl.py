@@ -25,17 +25,38 @@ from __future__ import annotations
 
 import argparse
 import re
+from dataclasses import dataclass
 
 from .. import ovn
 from ..context import Abort, Ctx, trace_verdict
 from ..inventory import Inventory
 from ..state import ACLS, Tracker, record
 from ..steps import StepRunner, add_step_args
+from .acl_audit import ACLAudit
 
 NAME = "acl"
 HELP = "declarative micro-segmentation ACLs"
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+
+
+@dataclass
+class ParsedRule:
+    """One entry of [acls].rules, split into its fields.
+
+    `error` is set instead of raising so a single bad line can be reported
+    against its own name rather than stopping the whole run.
+    """
+
+    name: str
+    direction: str
+    priority: str
+    action: str
+    group: str
+    specs: list[str]
+    raw: str
+    index: int = 0
+    error: str = ""
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -48,6 +69,8 @@ def register(subparsers) -> argparse.ArgumentParser:
                    help="ovn-trace the key allow/deny cases")
     g.add_argument("--list", dest="do_list", action="store_true",
                    help="show what is currently applied")
+    g.add_argument("--audit", action="store_true",
+                   help="test every rule in the yaml against what is deployed")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
@@ -162,18 +185,38 @@ class ACLManager:
             self.created.append(pg)
             ctx.log(f"Port group {pg} ({sel}): {len(members)} member(s).")
 
+    def parsed_rules(self) -> list[ParsedRule]:
+        """[acls].rules split into fields, in file order.
+
+        The deployer and the auditor both come through here. If they parsed
+        separately, a rule could mean one thing when applied and another
+        when checked, and the audit would be worth nothing.
+        """
+        out: list[ParsedRule] = []
+        for idx, raw in enumerate(self.rules):
+            if not raw.strip():
+                continue
+            parts = raw.split()
+            if len(parts) < 5:
+                out.append(ParsedRule(
+                    "", "", "", "", "", [], raw, idx,
+                    "needs at least 5 fields: <name> <direction> <priority> "
+                    "<action> <group> [spec...]"))
+                continue
+            name, direction, priority, action, group = parts[:5]
+            out.append(ParsedRule(name, direction, priority, action, group,
+                                  parts[5:], raw, idx))
+        return out
+
     def acl_rules(self) -> None:
         ctx = self.ctx
         ctx.dr_head("ACL rules")
-        for rule in self.rules:
-            if not rule.strip():
+        for rule in self.parsed_rules():
+            if rule.error:
+                ctx.warn(f"Skipping malformed rule: {rule.raw}")
                 continue
-            parts = rule.split()
-            if len(parts) < 5:
-                ctx.warn(f"Skipping malformed rule: {rule}")
-                continue
-            name, direction, priority, action, group = parts[:5]
-            rest = parts[5:]
+            name, direction, priority = rule.name, rule.direction, rule.priority
+            action, group = rule.action, rule.group
 
             # Accept a group created moments ago in this same run without
             # re-querying it; only fall back to the db for groups defined
@@ -184,7 +227,7 @@ class ACLManager:
                              f"'{group}' -- skipping.")
                     continue
 
-            match = self.build_match(direction, group, rest)
+            match = self.build_match(direction, group, rule.specs)
             ctx.run("ovn-nbctl", "--may-exist", "--type=port-group", "acl-add",
                     group, direction, priority, match, action)
             ctx.log(f"  {name}: [{priority}] {direction} {action}")
@@ -369,6 +412,12 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.require_cmd("ovn-nbctl")
 
     cmd = ACLManager(ctx)
+
+    # Before the enabled check on purpose. "We turned ACLs off -- is the
+    # policy actually gone?" is exactly the question an audit should be
+    # able to answer.
+    if args.audit:
+        return ACLAudit(cmd).run()
 
     # --list-steps is documentation: answer it even when the feature is
     # switched off, or "what would this do?" is unanswerable precisely

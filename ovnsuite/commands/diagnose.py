@@ -26,12 +26,10 @@ FIXES CARRIED OVER FROM THE SHELL VERSION
 from __future__ import annotations
 
 import argparse
-import os
 import re
-import sys
 
 from .. import netcalc, ovn
-from ..context import Ctx
+from ..context import Colour, Ctx
 from ..inventory import Inventory
 from ..state import (ACLS, LOCALNET_EXTERNAL, LOCALNET_INTERNAL, SETUP,
                      VM_CONFIG, VM_ISOLATION, Tracker)
@@ -44,24 +42,6 @@ PASS = "[ OK ]"
 FAIL = "[FAIL]"
 WARN = "[WARN]"
 SKIP = "[SKIP]"
-
-
-class _Colour:
-    """ANSI codes, but only when stdout is a terminal and NO_COLOR is unset.
-
-    Same rule as `deploy`. `ovnctl --no-color` exports NO_COLOR before the
-    subcommand runs, so honouring the variable covers the flag as well, and
-    a redirected run (`ovnctl diagnose > report.txt`) stays plain text.
-    """
-
-    def __init__(self) -> None:
-        enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-        self.red = "\033[31m" if enabled else ""
-        self.grn = "\033[32m" if enabled else ""
-        self.ylw = "\033[33m" if enabled else ""
-        self.dim = "\033[2m" if enabled else ""
-        self.bold = "\033[1m" if enabled else ""
-        self.rst = "\033[0m" if enabled else ""
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -112,7 +92,7 @@ class Diagnose:
         self.has_tracker = self.tracker.exists()
         self.flags = self.tracker.flags()
 
-        self.c = _Colour()
+        self.c = Colour()
         self.fail_count = 0
         self.warn_count = 0
         self.current_section = ""
