@@ -88,6 +88,10 @@ class Ctx:
     listing: bool = False
     changes: int = 0
     warnings: int = 0
+    # Ceiling for read-only queries. ovn-nbctl and ovn-sbctl wait on the db
+    # forever by default, and the commands that query them are the ones run
+    # while that db is unreachable.
+    query_timeout: float = 15.0
     _config: Config | None = field(default=None, repr=False)
 
     # ------------------------------------------------------------------
@@ -219,24 +223,37 @@ class Ctx:
             )
         return res
 
-    def q(self, *argv: object) -> Result:
+    def q(self, *argv: object, timeout: float | None = None) -> Result:
         """A read-only QUERY.
 
         Never wrapped by dry-run: the printed command list has to reflect
         what would actually change given the current state of the system,
         which means the queries that decide that must really run.
+
+        Always bounded. A hung query is worse than a failed one: `diagnose`
+        runs twenty-odd checks and a single blocking ovn-sbctl call means
+        none of the remaining ones ever report. Timing out yields a normal
+        failed Result (rc 124, as timeout(1) uses), so every existing
+        `if not res.ok` path already handles it.
         """
         cmd = [str(a) for a in argv]
+        limit = self.query_timeout if timeout is None else timeout
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  check=False, timeout=limit)
         except FileNotFoundError:
             return Result(127, "", f"{cmd[0]}: command not found")
+        except subprocess.TimeoutExpired:
+            return Result(124, "",
+                          f"timed out after {limit:g}s: {format_cmd(cmd)}")
+        except OSError as exc:  # found, but not runnable (126, as a shell does)
+            return Result(126, "", f"{cmd[0]}: {exc}")
         return Result(proc.returncode, (proc.stdout or "").strip(),
                       (proc.stderr or "").strip())
 
-    def qout(self, *argv: object) -> str:
+    def qout(self, *argv: object, timeout: float | None = None) -> str:
         """Query, returning stdout only ('' on failure)."""
-        return self.q(*argv).stdout
+        return self.q(*argv, timeout=timeout).stdout
 
     # ------------------------------------------------------------------
     # preconditions

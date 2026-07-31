@@ -26,8 +26,9 @@ FIXES CARRIED OVER FROM THE SHELL VERSION
 from __future__ import annotations
 
 import argparse
+import os
 import re
-import subprocess
+import sys
 
 from .. import netcalc, ovn
 from ..context import Ctx
@@ -43,6 +44,24 @@ PASS = "[ OK ]"
 FAIL = "[FAIL]"
 WARN = "[WARN]"
 SKIP = "[SKIP]"
+
+
+class _Colour:
+    """ANSI codes, but only when stdout is a terminal and NO_COLOR is unset.
+
+    Same rule as `deploy`. `ovnctl --no-color` exports NO_COLOR before the
+    subcommand runs, so honouring the variable covers the flag as well, and
+    a redirected run (`ovnctl diagnose > report.txt`) stays plain text.
+    """
+
+    def __init__(self) -> None:
+        enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        self.red = "\033[31m" if enabled else ""
+        self.grn = "\033[32m" if enabled else ""
+        self.ylw = "\033[33m" if enabled else ""
+        self.dim = "\033[2m" if enabled else ""
+        self.bold = "\033[1m" if enabled else ""
+        self.rst = "\033[0m" if enabled else ""
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -93,15 +112,18 @@ class Diagnose:
         self.has_tracker = self.tracker.exists()
         self.flags = self.tracker.flags()
 
+        self.c = _Colour()
         self.fail_count = 0
         self.warn_count = 0
+        self.current_section = ""
+        self.failed_sections: list[str] = []
 
     # ------------------------------------------------------------------
     # reporting
     # ------------------------------------------------------------------
-    @staticmethod
-    def section(title: str) -> None:
-        print(f"\n=== {title} ===")
+    def section(self, title: str) -> None:
+        self.current_section = title
+        print(f"\n{self.c.bold}=== {title} ==={self.c.rst}")
 
     @staticmethod
     def detail(*lines: str) -> None:
@@ -113,19 +135,31 @@ class Diagnose:
         for line in str(text).splitlines():
             print(f"        {line}")
 
+    def _tag(self, colour: str, tag: str, msg: str) -> None:
+        """Only the tag is coloured.
+
+        The message itself often wraps onto detail lines below it, and
+        colouring a whole paragraph makes the escape codes outlive the line
+        in anything that reflows the output.
+        """
+        print(f"{colour}{tag}{self.c.rst} {msg}")
+
     def ok(self, msg: str) -> None:
-        print(f"{PASS} {msg}")
+        self._tag(self.c.grn, PASS, msg)
 
     def bad(self, msg: str) -> None:
-        print(f"{FAIL} {msg}")
+        self._tag(self.c.red + self.c.bold, FAIL, msg)
         self.fail_count += 1
+        if self.current_section \
+                and self.current_section not in self.failed_sections:
+            self.failed_sections.append(self.current_section)
 
     def note(self, msg: str) -> None:
-        print(f"{WARN} {msg}")
+        self._tag(self.c.ylw, WARN, msg)
         self.warn_count += 1
 
     def skip(self, msg: str) -> None:
-        print(f"{SKIP} {msg}")
+        self._tag(self.c.dim, SKIP, msg)
 
     def not_deployed(self, key: str) -> bool:
         """True if the tracker is active and says this was NOT deployed.
@@ -355,8 +389,12 @@ class Diagnose:
             self.detail(f"(tracker: vm-config not run -- only {self.host_if} and router",
                         " ports are expected; VM VIFs would be leftovers)")
 
-        ports = ovn.port_binding_ports(ctx)
-        if not ports:
+        # One query for the whole table. The previous shape cost two
+        # ovn-sbctl invocations per port (type, then chassis) plus an
+        # ovs-vsctl per unbound VIF, which on a busy host is a hundred-odd
+        # forks to answer a question the SB db can answer in one.
+        rows = ovn.sb_json(ctx, "logical_port,type,chassis", "Port_Binding")
+        if not rows:
             self.bad("No Port_Binding rows at all in the SB db -- NB config has not")
             self.detail("propagated (is ovn-northd running?).")
             return
@@ -365,18 +403,25 @@ class Diagnose:
                    "chassisredirect"}
         total = bound = skipped = problems = 0
         off_vifs: list[str] = []
+        # Fetched on first use: a fully bound host never needs it.
+        taps: dict[str, str] | None = None
 
-        for lp in ports:
+        for row in rows:
+            if len(row) < 3:
+                continue
+            lp = str(row[0])
+            ptype = str(row[1] or "")
             total += 1
-            ptype = ovn.port_binding_type(ctx, lp)
             if ptype in non_vif:
                 skipped += 1
                 continue
-            if ovn.port_binding_chassis(ctx, lp):
+            if ovn.ref_is_set(row[2]):
                 bound += 1
                 continue
             # Unbound VIF -- is a local OVS interface carrying this iface-id?
-            tap = ovn.iface_for_iface_id(ctx, lp)
+            if taps is None:
+                taps = ovn.iface_id_map(ctx)
+            tap = taps.get(lp, "")
             if tap:
                 self.bad(f"VIF '{lp}' is plugged into local OVS (interface: {tap}) "
                          "but has NO chassis bound.")
@@ -891,12 +936,8 @@ class Diagnose:
                       "(less conclusive).")
             cmd = ["ping", "-c", "2", "-W", "1", self.gateway]
 
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  check=False, timeout=15)
-            output = (proc.stdout or "") + (proc.stderr or "")
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            output = str(exc)
+        res = ctx.q(*cmd, timeout=15)
+        output = "\n".join(p for p in (res.stdout, res.stderr) if p)
 
         if re.search(r"1 received|1 packets received|reply from", output,
                      re.IGNORECASE):
@@ -907,8 +948,17 @@ class Diagnose:
 
     # ------------------------------------------------------------------
     def summary(self) -> None:
+        c = self.c
         self.section("Summary / likely next step")
-        print(f"Result: {self.fail_count} failure(s), {self.warn_count} warning(s).")
+        fails = (f"{c.red}{c.bold}{self.fail_count}{c.rst}" if self.fail_count
+                 else f"{c.grn}0{c.rst}")
+        warns = (f"{c.ylw}{self.warn_count}{c.rst}" if self.warn_count
+                 else f"{c.grn}0{c.rst}")
+        print(f"Result: {fails} failure(s), {warns} warning(s).")
+        if self.failed_sections:
+            print(f"{c.red}{c.bold}Failing sections:{c.rst}")
+            for name in self.failed_sections:
+                print(f"  {name}")
         if self.has_tracker:
             print("Tracker gating was ACTIVE -- [SKIP] sections were not counted.")
         else:

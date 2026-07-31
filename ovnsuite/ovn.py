@@ -49,6 +49,25 @@ def iface_for_iface_id(ctx: Ctx, iface_id: str) -> str:
     return out.splitlines()[0].strip() if out.strip() else ""
 
 
+def iface_id_map(ctx: Ctx) -> dict[str, str]:
+    """Every local OVS interface carrying an iface-id: iface-id -> name.
+
+    One query for the whole table. iface_for_iface_id() is the same lookup
+    for a single id; use this one when more than a couple are wanted.
+    """
+    rows = _json_rows(
+        ctx.qout("ovs-vsctl", "--format=json", "--columns=name,external_ids",
+                 "list", "Interface"), "name,external_ids")
+    found: dict[str, str] = {}
+    for row in rows:
+        if len(row) < 2:
+            continue
+        for key, value in _json_map(row[1]):
+            if key == "iface-id" and value:
+                found.setdefault(value, str(row[0]))
+    return found
+
+
 def iface_id_of(ctx: Ctx, iface: str) -> str:
     res = ctx.q("ovs-vsctl", "get", "interface", iface, "external-ids:iface-id")
     return res.stdout.strip('"') if res.ok else ""
@@ -141,16 +160,51 @@ def port_security(ctx: Ctx, port: str) -> str:
                     "Logical_Switch_Port", port)
 
 
-def nb_json(ctx: Ctx, columns: str, table: str, *extra: str) -> list[list]:
-    """`ovn-nbctl --format=json --columns=... list TABLE` -> rows."""
-    out = ctx.qout("ovn-nbctl", "--format=json", f"--columns={columns}",
-                   "list", table, *extra)
+def _json_rows(out: str, columns: str) -> list[list]:
+    """`--format=json` output -> rows, in the order the columns were asked for.
+
+    ovsdb reports what it actually returned in "headings"; keying off that
+    rather than trusting the order of --columns costs nothing and means a
+    reordered response cannot silently shift every field by one.
+    """
     if not out:
         return []
     try:
-        return json.loads(out).get("data", [])
+        parsed = json.loads(out)
+        data = parsed.get("data", [])
+        headings = parsed.get("headings", [])
     except (ValueError, AttributeError):
         return []
+    want = [c.strip() for c in columns.split(",")]
+    if headings and headings != want and all(c in headings for c in want):
+        idx = [headings.index(c) for c in want]
+        return [[row[i] if i < len(row) else "" for i in idx] for row in data]
+    return data
+
+
+def _json_map(value) -> list[tuple[str, str]]:
+    """An ovsdb map column (['map', [[k, v], ...]]) as pairs."""
+    if isinstance(value, list) and len(value) == 2 and value[0] == "map":
+        return [(str(p[0]), str(p[1])) for p in value[1] if len(p) == 2]
+    return []
+
+
+def ref_is_set(value) -> bool:
+    """True if an ovsdb reference column actually points at a row.
+
+    JSON renders an unset reference as ['set', []] and a set one as
+    ['uuid', '...']. A bare truthiness test calls the empty case True.
+    """
+    if isinstance(value, list) and len(value) == 2 and value[0] == "set":
+        return bool(value[1])
+    return bool(value)
+
+
+def nb_json(ctx: Ctx, columns: str, table: str, *extra: str) -> list[list]:
+    """`ovn-nbctl --format=json --columns=... list TABLE` -> rows."""
+    return _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", f"--columns={columns}",
+                 "list", table, *extra), columns)
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +232,20 @@ def port_binding_type(ctx: Ctx, logical_port: str) -> str:
 def port_binding_ports(ctx: Ctx) -> list[str]:
     return ctx.q("ovn-sbctl", "--bare", "--columns=logical_port", "list",
                  "Port_Binding").lines
+
+
+def sb_json(ctx: Ctx, columns: str, table: str, *extra: str) -> list[list]:
+    """`ovn-sbctl --format=json --columns=... list TABLE` -> rows.
+
+    Preferred over sb_records() for multi-column reads: --bare prints an
+    empty column as a blank line and uses a blank line as the record
+    separator too, so an empty column in the MIDDLE of the list (a VIF's
+    'type', an unbound port's 'chassis') is indistinguishable from the end
+    of a record. JSON has no such ambiguity.
+    """
+    return _json_rows(
+        ctx.qout("ovn-sbctl", "--format=json", f"--columns={columns}",
+                 "list", table, *extra), columns)
 
 
 def sb_records(ctx: Ctx, columns: str, table: str,
