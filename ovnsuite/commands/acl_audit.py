@@ -79,6 +79,19 @@ class ACLAudit:
         self.warnings = 0
         self._matches: dict[int, str | None] = {}
 
+        # Port groups this file does not own. vm_isolation creates and
+        # manages its own group, and it is not drift just because [acls]
+        # has never heard of it -- telling someone to pg-del it would tear
+        # down the isolation policy.
+        cfg = self.ctx.config
+        owned_elsewhere = cfg.cfg_opt("vm_isolation", "pg_name", "").strip()
+        self.foreign_pgs = {owned_elsewhere} if owned_elsewhere else set()
+        # These, by contrast, are meant to be gone: vm_isolation deletes
+        # them on every apply.
+        self.legacy_pgs = [p.strip() for p
+                           in cfg.cfg_list("vm_isolation", "legacy_pg_names")
+                           if p.strip() and p.strip() not in self.foreign_pgs]
+
     # ------------------------------------------------------------------
     # reporting
     # ------------------------------------------------------------------
@@ -183,7 +196,13 @@ class ACLAudit:
                     f"action '{rule.action}' is not one of "
                     f"{' / '.join(_ACTIONS)}")
             if rule.group not in declared:
-                if rule.group in db:
+                if rule.group in self.foreign_pgs:
+                    problems.append(
+                        f"targets port group '{rule.group}', which belongs to "
+                        "[vm_isolation] -- its membership is managed there, "
+                        "and `ovnctl vm-isolation` recreates it, dropping any "
+                        "ACL attached here")
+                elif rule.group in db:
                     problems.append(
                         f"targets port group '{rule.group}', which exists in "
                         "the db but is not declared in acls.port_groups -- "
@@ -494,15 +513,36 @@ class ACLAudit:
                           f"remedy      ovn-nbctl acl-del {pg} {acl.direction} "
                           f"{acl.priority} '{acl.match}'")
 
+        for legacy in self.legacy_pgs:
+            group = db.get(legacy)
+            if group is None:
+                continue
+            clean = False
+            self.fail(f"{legacy}: legacy port group still present",
+                      f"{len(group.ports)} member(s), {len(group.acls)} ACL(s)",
+                      "vm_isolation.legacy_pg_names lists this for deletion. "
+                      "The hyphen means it could never be referenced as "
+                      f"@{legacy} in a match -- OVN's lexer rejects it -- so "
+                      "whatever it left behind was never scoped to its "
+                      "members and applies switch-wide.",
+                      f"remedy      ovnctl vm-isolation  (deletes it on apply)"
+                      f"  |  ovn-nbctl pg-del {legacy}")
+
         for pg in sorted(db):
-            if pg in declared:
+            if pg in declared or pg in self.legacy_pgs:
                 continue
             group = db[pg]
+            if pg in self.foreign_pgs:
+                self.skip(f"{pg:<16}  owned by [vm_isolation] -- "
+                          f"{len(group.ports)} member(s), {len(group.acls)} "
+                          "ACL(s), not audited here")
+                continue
             clean = False
             self.warn(f"{pg} is not declared in acls.port_groups",
                       f"{len(group.ports)} member(s), {len(group.acls)} ACL(s)",
-                      "Not managed from this file. Fine if another tool owns "
-                      "it; drift if it is a leftover from an older rule set.",
+                      "Not managed from this file, and not one of the groups "
+                      "another part of the suite owns. Fine if something "
+                      "outside it owns the group; drift if it is a leftover.",
                       f"remedy      ovn-nbctl pg-del {pg}  (if it is stale)")
 
         if clean:
