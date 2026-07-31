@@ -1,0 +1,416 @@
+"""
+ovnctl setup -- port of ovn-setup.sh
+
+Sets up a single-node OVN environment:
+  - configures OVS external-ids (if not already set)
+  - starts ovn-controller and waits for br-int
+  - creates the logical switches (ls-int-vm, ls-ext-vm, ls-host)
+  - creates the logical router (lr-core) with a port on each segment
+  - attaches the switches to the router
+  - creates a host-facing OVN interface for the host itself
+"""
+
+from __future__ import annotations
+
+import argparse
+import socket
+import time
+
+from .. import ovn
+from ..context import Abort, Ctx
+from ..state import SETUP, record
+from ..steps import StepRunner, add_step_args
+
+NAME = "setup"
+HELP = "base topology, host segment, logical router"
+
+REQUIRED_CFG = (
+    "setup:host_if_ip", "setup:host_if_mac", "setup:host_if_prefix",
+    "setup:lrp_ext", "setup:lrp_ext_cidr", "setup:lrp_ext_mac",
+    "setup:lrp_host", "setup:lrp_host_cidr", "setup:lrp_host_mac",
+    "setup:lrp_int", "setup:lrp_int_cidr", "setup:lrp_int_mac",
+    "setup:ovn_encap_ip", "setup:ovn_encap_type", "setup:ovn_remote",
+    "topology:br_int", "topology:host_if", "topology:lr_core",
+    "topology:ls_ext", "topology:ls_host", "topology:ls_int",
+)
+
+
+def register(subparsers) -> argparse.ArgumentParser:
+    p = subparsers.add_parser(NAME, help=HELP, description=__doc__,
+                              formatter_class=argparse.RawDescriptionHelpFormatter)
+    add_step_args(p)
+    p.set_defaults(func=main)
+    return p
+
+
+class Setup:
+    def __init__(self, ctx: Ctx):
+        self.ctx = ctx
+        c = ctx.config
+
+        self.ovn_remote = c.cfg("setup", "ovn_remote")
+        self.encap_type = c.cfg("setup", "ovn_encap_type")
+        self.encap_ip = c.cfg("setup", "ovn_encap_ip")
+
+        # A fixed system_id in the yaml is strongly preferred: it prevents
+        # chassis identity drift across reboots. An empty value falls back
+        # to the hostname, which is exactly what causes that drift.
+        self.system_id = c.cfg_opt("setup", "system_id", "") or socket.gethostname()
+
+        self.ls_int = c.cfg("topology", "ls_int")
+        self.ls_ext = c.cfg("topology", "ls_ext")
+        self.ls_host = c.cfg("topology", "ls_host")
+        self.lr_core = c.cfg("topology", "lr_core")
+        self.br_int = c.cfg("topology", "br_int")
+
+        self.lrp_int = c.cfg("setup", "lrp_int")
+        self.lrp_int_mac = c.cfg("setup", "lrp_int_mac")
+        self.lrp_int_cidr = c.cfg("setup", "lrp_int_cidr")
+
+        self.lrp_ext = c.cfg("setup", "lrp_ext")
+        self.lrp_ext_mac = c.cfg("setup", "lrp_ext_mac")
+        self.lrp_ext_cidr = c.cfg("setup", "lrp_ext_cidr")
+
+        self.lrp_host = c.cfg("setup", "lrp_host")
+        self.lrp_host_mac = c.cfg("setup", "lrp_host_mac")
+        self.lrp_host_cidr = c.cfg("setup", "lrp_host_cidr")
+        self.host_gw = self.lrp_host_cidr.split("/")[0]
+
+        # host-if sits on its own /30, not on the VM subnet, so the
+        # workstation LAN can be routed to it without putting laptops on a
+        # VM segment.
+        self.host_if = c.cfg("topology", "host_if")
+        self.host_if_mac = c.cfg("setup", "host_if_mac")
+        self.host_if_ip = c.cfg("setup", "host_if_ip")
+        self.host_if_cidr = f"{self.host_if_ip}/{c.cfg('setup', 'host_if_prefix')}"
+
+        # Everything the host needs to reach through the router. The legacy
+        # single-route fields are still honoured if host_routes is absent.
+        routes = c.cfg_array("setup", "host_routes")
+        self.host_routes = routes if routes else [c.cfg("setup", "remote_subnet")]
+
+    # -- 1 ---------------------------------------------------------------
+    def external_ids(self) -> None:
+        ctx = self.ctx
+        ctx.dr_head("OVS external-ids")
+        ctx.log("Checking OVS external-ids for ovn-remote...")
+
+        # `ovs-vsctl get open . external_ids` is NEVER literally "{}" -- OVS
+        # always populates hostname/rundir. So check for the ovn-remote key
+        # specifically, not whether the whole map is empty.
+        if ovn.has_external_id(ctx, "ovn-remote"):
+            ctx.log(f"ovn-remote already set ({ovn.external_id(ctx, 'ovn-remote')}), skipping.")
+            return
+
+        ctx.log("ovn-remote not set, configuring for single-node (remote = localhost)...")
+        ctx.run("ovs-vsctl", "set", "open", ".",
+                f"external-ids:ovn-remote={self.ovn_remote}",
+                f"external-ids:ovn-encap-type={self.encap_type}",
+                f"external-ids:ovn-encap-ip={self.encap_ip}",
+                f"external-ids:system-id={self.system_id}")
+        ctx.log("external-ids configured.")
+
+    # -- 1b --------------------------------------------------------------
+    def ovn_controller(self) -> None:
+        """Make sure ovn-controller is running and br-int has been created.
+
+        br-int is auto-created by ovn-controller once it connects to the SB
+        db using the external-ids set above -- if it is missing,
+        ovn-controller is either not running or not connected.
+        """
+        ctx = self.ctx
+        ctx.dr_head("ovn-controller / br-int")
+        ctx.log("Checking for br-int / ovn-controller...")
+
+        if ovn.br_exists(ctx, self.br_int):
+            ctx.log("br-int already exists.")
+            return
+
+        ctx.log("br-int not found -- starting the OVN control plane.")
+
+        # openvswitch must be up first; ovn-controller cannot create br-int
+        # without it.
+        if ctx.have("systemctl"):
+            for unit in ("openvswitch", "ovs-vswitchd"):
+                if ctx.unit_exists(unit):
+                    if not ctx.unit_active(unit):
+                        ctx.log(f"Starting {unit}...")
+                        if not ctx.run("systemctl", "start", unit):
+                            ctx.warn(f"Failed to start {unit}.")
+                    break
+
+        # The Southbound db must be reachable, or ovn-controller starts and
+        # then sits retrying forever.
+        sb_sock = self.ovn_remote[len("unix:"):] if self.ovn_remote.startswith("unix:") else ""
+        if sb_sock:
+            from pathlib import Path
+            import stat as _stat
+            sock = Path(sb_sock)
+            exists = sock.exists() and _stat.S_ISSOCK(sock.stat().st_mode)
+            if not exists:
+                ctx.warn(f"SB socket {sb_sock} does not exist -- the OVN central services")
+                ctx.warn("are not running. Starting ovn-northd...")
+                if ctx.have("systemctl"):
+                    for unit in ("ovn-northd", "ovn-ovsdb-server-nb",
+                                 "ovn-ovsdb-server-sb"):
+                        if ctx.unit_exists(unit):
+                            ctx.run("systemctl", "start", unit)
+                elif ctx.have("ovn-ctl"):
+                    ctx.run("ovn-ctl", "start_northd")
+                if not ctx.dry_run:
+                    time.sleep(2)
+
+        started = False
+        if ctx.have("systemctl") and ctx.unit_exists("ovn-controller"):
+            if ctx.unit_active("ovn-controller"):
+                ctx.log("ovn-controller service is already active.")
+                started = True
+            else:
+                # reset-failed first, so a unit left 'failed' by a previous
+                # teardown can start again.
+                ctx.run("systemctl", "reset-failed", "ovn-controller")
+                ctx.log("Starting ovn-controller service...")
+                if ctx.run("systemctl", "enable", "--now", "ovn-controller"):
+                    started = True
+                elif ctx.run("systemctl", "start", "ovn-controller"):
+                    started = True
+                else:
+                    ctx.warn("systemctl could not start ovn-controller.")
+
+        if not started and ctx.have("ovn-ctl"):
+            ctx.log("Falling back to ovn-ctl start_controller...")
+            if ctx.run("ovn-ctl", "start_controller"):
+                started = True
+
+        if not started:
+            ctx.warn("Could not start ovn-controller by any method.")
+
+        if ctx.dry_run:
+            return
+
+        ctx.log("Waiting for br-int (up to 30s)...")
+        for _ in range(30):
+            if ovn.br_exists(ctx, self.br_int):
+                ctx.log("br-int is up.")
+                return
+            time.sleep(1)
+
+        self._br_int_diagnosis(sb_sock)
+
+    def _br_int_diagnosis(self, sb_sock: str) -> None:
+        ctx = self.ctx
+        running = ctx.q("pgrep", "-x", "ovn-controller").ok
+        lines = [
+            "",
+            "State right now:",
+            f"  ovn-controller process : {'running' if running else 'NOT running'}",
+        ]
+        if ctx.have("systemctl"):
+            unit_state = ctx.qout("systemctl", "is-active", "ovn-controller") or "unknown"
+            lines.append(f"  systemd unit           : {unit_state}")
+        lines.append(f"  ovn-remote             : {self.ovn_remote}")
+        if sb_sock:
+            from pathlib import Path
+            lines.append(f"  SB socket exists       : {'yes' if Path(sb_sock).exists() else 'NO'}")
+        lines += [
+            "",
+            "Most likely causes:",
+            "  - The OVN central services are not running (ovn-northd / ovsdb-server)",
+            "  - ovn-controller cannot reach the SB db at the ovn-remote above",
+            "  - A previous teardown left the unit in a failed state",
+            "    (systemctl reset-failed ovn-controller ; systemctl start ovn-controller)",
+            "",
+            "Check: journalctl -u ovn-controller -e --no-pager | tail -30",
+            "",
+        ]
+        raise Abort("br-int still does not exist after waiting.\n" + "\n".join(lines))
+
+    # -- 2 ---------------------------------------------------------------
+    def logical_switches(self) -> None:
+        ctx = self.ctx
+        ctx.dr_head("Logical switches")
+        ctx.log("Creating logical switches...")
+        for switch in (self.ls_int, self.ls_ext, self.ls_host):
+            ctx.run("ovn-nbctl", "--may-exist", "ls-add", switch)
+
+    # -- 3 ---------------------------------------------------------------
+    def logical_router(self) -> None:
+        ctx = self.ctx
+        ctx.dr_head("Logical router + gateway ports")
+        ctx.log("Creating logical router...")
+        ctx.run("ovn-nbctl", "--may-exist", "lr-add", self.lr_core)
+
+        existing = ovn.lrp_list(ctx, self.lr_core)
+        for port, mac, cidr in (
+            (self.lrp_int, self.lrp_int_mac, self.lrp_int_cidr),
+            (self.lrp_ext, self.lrp_ext_mac, self.lrp_ext_cidr),
+            (self.lrp_host, self.lrp_host_mac, self.lrp_host_cidr),
+        ):
+            if port not in existing:
+                ctx.run("ovn-nbctl", "lrp-add", self.lr_core, port, mac, cidr)
+
+    # -- 4 ---------------------------------------------------------------
+    def attach_switches(self) -> None:
+        ctx = self.ctx
+        ctx.dr_head("Attach switches to router")
+        for switch, lrp in ((self.ls_int, self.lrp_int),
+                            (self.ls_ext, self.lrp_ext),
+                            (self.ls_host, self.lrp_host)):
+            ctx.log(f"Attaching {switch} to router...")
+            peer = f"{switch}-to-lr"
+            ctx.run("ovn-nbctl", "--may-exist", "lsp-add", switch, peer)
+            ctx.run("ovn-nbctl", "lsp-set-type", peer, "router")
+            ctx.run("ovn-nbctl", "lsp-set-addresses", peer, "router")
+            ctx.run("ovn-nbctl", "lsp-set-options", peer, f"router-port={lrp}")
+
+    # -- 5 ---------------------------------------------------------------
+    def host_interface(self) -> None:
+        ctx = self.ctx
+        ctx.dr_head("Host-facing port")
+        ctx.log(f"Creating host OVN interface ({self.host_if}) on "
+                f"{self.ls_host} ({self.host_if_cidr})...")
+
+        if ctx.have("ovn-sbctl"):
+            if "Chassis" not in ctx.qout("ovn-sbctl", "show"):
+                ctx.log("WARNING: no Chassis registered in the Southbound db yet.")
+                ctx.log("ovn-controller may still be connecting; ports may stay "
+                        "'down' until it does.")
+
+        # Migration: host-if used to live on the VM switch. If it is still
+        # there (or on any switch other than ls_host), remove it first --
+        # lsp-add would otherwise fail with a duplicate-name error.
+        if ovn.lsp_exists(ctx, self.host_if):
+            if self.host_if not in ovn.lsp_list(ctx, self.ls_host):
+                ctx.log(f"Migrating {self.host_if} to {self.ls_host} "
+                        "(it was on another switch)...")
+                ctx.run("ovn-nbctl", "--if-exists", "lsp-del", self.host_if)
+
+        if not ctx.q("ovs-vsctl", "port-to-br", self.host_if).ok:
+            ctx.run("ovs-vsctl", "add-port", self.br_int, self.host_if,
+                    "--", "set", "interface", self.host_if, "type=internal",
+                    f'mac="{self.host_if_mac}"')
+        else:
+            ctx.log(f"OVS port {self.host_if} already exists, skipping add-port.")
+
+        ctx.run("ovn-nbctl", "--may-exist", "lsp-add", self.ls_host, self.host_if)
+        ctx.run("ovn-nbctl", "lsp-set-addresses", self.host_if,
+                f"{self.host_if_mac} {self.host_if_ip}")
+        ctx.run("ovs-vsctl", "set", "interface", self.host_if,
+                f"external-ids:iface-id={self.host_if}")
+        ctx.run("ip", "link", "set", self.host_if, "up")
+
+        self._fix_kernel_mac()
+        self._fix_addresses()
+        self._add_routes()
+
+        if ctx.dry_run:
+            return
+
+        self._verify_and_report()
+
+    def _kernel_mac(self) -> str:
+        out = self.ctx.qout("ip", "-o", "link", "show", "dev", self.host_if)
+        parts = out.split()
+        # "N: name: <FLAGS> mtu ... link/ether <mac> brd ..."
+        for i, tok in enumerate(parts):
+            if tok.startswith("link/") and i + 1 < len(parts):
+                return parts[i + 1]
+        return ""
+
+    def _fix_kernel_mac(self) -> None:
+        ctx = self.ctx
+        kernel_mac = self._kernel_mac()
+        if kernel_mac and kernel_mac.lower() != self.host_if_mac.lower():
+            ctx.log(f"Kernel MAC ({kernel_mac}) does not match desired MAC "
+                    f"({self.host_if_mac}), fixing...")
+            ctx.run("ip", "link", "set", "dev", self.host_if, "down")
+            ctx.run("ip", "link", "set", "dev", self.host_if, "address",
+                    self.host_if_mac)
+            ctx.run("ip", "link", "set", "dev", self.host_if, "up")
+
+    def _fix_addresses(self) -> None:
+        """Drop any address that is not the one we want.
+
+        Removing the old address also removes its connected route and
+        anything that used it, which is what makes the move off the VM
+        subnet clean.
+        """
+        ctx = self.ctx
+        out = ctx.qout("ip", "-4", "-o", "addr", "show", "dev", self.host_if)
+        existing = [ln.split()[3] for ln in out.splitlines() if len(ln.split()) > 3]
+        for addr in existing:
+            if addr != self.host_if_cidr:
+                ctx.log(f"Removing stale address {addr} from {self.host_if}...")
+                ctx.run("ip", "addr", "del", addr, "dev", self.host_if)
+
+        if self.host_if_cidr not in existing:
+            ctx.run("ip", "addr", "add", self.host_if_cidr, "dev", self.host_if)
+        else:
+            ctx.log(f"Address {self.host_if_cidr} already assigned to "
+                    f"{self.host_if}, skipping.")
+
+    def _add_routes(self) -> None:
+        """host-if is no longer on the VM segment, so every internal
+        destination is now a routed hop via the router port."""
+        ctx = self.ctx
+        for net in self.host_routes:
+            if not net.strip():
+                continue
+            ctx.run("ip", "route", "replace", net, "via", self.host_gw,
+                    "dev", self.host_if)
+            ctx.log(f"Route {net} via {self.host_gw} dev {self.host_if}")
+
+    def _verify_and_report(self) -> None:
+        ctx = self.ctx
+        kernel_mac = self._kernel_mac()
+        if kernel_mac.lower() == self.host_if_mac.lower():
+            ctx.log(f"Verified: {self.host_if} kernel MAC matches OVN logical "
+                    f"port MAC ({self.host_if_mac}).")
+        else:
+            ctx.warn(f"{self.host_if} kernel MAC is {kernel_mac}, "
+                     f"expected {self.host_if_mac}.")
+            ctx.warn("Traffic sourced from this host may not match what OVN expects.")
+
+        if not ctx.verbose:
+            return
+        net = self.host_if_cidr.split("/")[0]
+        print("")
+        print("=== Host segment ===")
+        print(f"  host-if      {self.host_if_cidr}   "
+              f"(was on {self.ls_int}, now on {self.ls_host})")
+        print(f"  gateway      {self.host_gw}   ({self.lrp_host} on {self.lr_core})")
+        print(f"  routes via   {self.host_gw}:  {' '.join(self.host_routes)}")
+        print("")
+        print(f"For workstation laptops to reach {self.host_if_ip}, "
+              "BOTH upstream firewalls need:")
+        print(f"  a route for {net}/30 pointing back toward 172.31.1.6")
+        print("  and a rule permitting that traffic in both directions.")
+
+
+def main(ctx: Ctx, args: argparse.Namespace) -> int:
+    ctx.load_config("ovn-setup")
+    # Fail before changing anything if the settings file is incomplete.
+    ctx.require_cfg(*REQUIRED_CFG)
+
+    ctx.require_root()
+    ctx.require_cmd("ovs-vsctl", "ovn-nbctl", "ip")
+
+    setup = Setup(ctx)
+    runner = StepRunner(ctx, "setup")
+    runner.add("external-ids", "configure OVS external-ids", setup.external_ids)
+    runner.add("ovn-controller", "start the control plane, wait for br-int",
+               setup.ovn_controller)
+    runner.add("switches", "create the logical switches", setup.logical_switches)
+    runner.add("logical-router", "create lr-core and its gateway ports",
+               setup.logical_router)
+    runner.add("attach-switches", "attach each switch to the router",
+               setup.attach_switches)
+    runner.add("host-interface", "create host-if, address it, add routes",
+               setup.host_interface)
+
+    if not runner.run(args):
+        return 0
+
+    record(ctx, SETUP, runner)
+    ctx.finish("base topology, host segment, router")
+    return 0

@@ -1,0 +1,297 @@
+"""
+Shared behaviour for every subcommand -- the port of ovn-common.sh and
+ovn-dryrun.sh.
+
+OUTPUT CONTRACT (unchanged from the shell suite)
+  success  : one summary line, nothing else
+  -v       : the full step-by-step narration
+  --dry-run: the commands that would run, and nothing else
+  warnings : always, on stderr
+  errors   : always, on stderr, then exit non-zero
+
+Nothing here is optional or best-effort. If the settings file is missing
+the run stops with a clear message rather than silently falling back to
+built-in defaults and producing a deployment that does not match the
+configuration.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from . import paths
+from .config import Config, ConfigError
+
+# Characters that never need quoting in the dry-run listing.
+_SAFE_RE = re.compile(r"^[A-Za-z0-9_./:=@%+,-]+$")
+
+
+def shquote(arg: str) -> str:
+    """Port of _dr_quote: shell-safe, but readable for the common case."""
+    if arg == "":
+        return "''"
+    if _SAFE_RE.match(arg):
+        return arg
+    return "'" + arg.replace("'", "'\\''") + "'"
+
+
+def format_cmd(argv: list[str]) -> str:
+    return " ".join(shquote(str(a)) for a in argv)
+
+
+class Abort(Exception):
+    """Fatal error -- message already formatted, exit non-zero."""
+
+    def __init__(self, message: str, code: int = 1):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+@dataclass
+class Result:
+    """Outcome of a command invocation."""
+
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.returncode == 0
+
+    def __bool__(self) -> bool:  # so `if ctx.run(...)` reads naturally
+        return self.ok
+
+    @property
+    def lines(self) -> list[str]:
+        return [ln for ln in self.stdout.splitlines() if ln.strip()]
+
+
+@dataclass
+class Ctx:
+    """Per-run state: flags, counters, and the configuration."""
+
+    prefix: str = "ovn"
+    verbose: bool = False
+    dry_run: bool = False
+    # True for --list-steps. The listing is documentation, so it must work
+    # on a laptop with no OVN installed and no root -- the preconditions
+    # below are skipped rather than turning "what does this do?" into an
+    # error about a missing binary.
+    listing: bool = False
+    changes: int = 0
+    warnings: int = 0
+    _config: Config | None = field(default=None, repr=False)
+
+    # ------------------------------------------------------------------
+    # configuration
+    # ------------------------------------------------------------------
+    @property
+    def cfg_file(self) -> Path:
+        return self._config.path if self._config else paths.settings_file()
+
+    def load_config(self, prefix: str | None = None) -> Config:
+        """Port of ovn_common_init: set the log prefix and load the yaml."""
+        if prefix:
+            self.prefix = prefix
+        if self._config is None:
+            self._config = Config().load()
+        return self._config
+
+    @property
+    def config(self) -> Config:
+        if self._config is None:
+            self._config = Config().load()
+        return self._config
+
+    # Thin pass-throughs so command modules read like the shell did.
+    def cfg(self, section: str, key: str) -> str:
+        return self.config.cfg(section, key)
+
+    def cfg_opt(self, section: str, key: str, default: str = "") -> str:
+        return self.config.cfg_opt(section, key, default)
+
+    def cfg_int(self, section: str, key: str) -> int:
+        return self.config.cfg_int(section, key)
+
+    def cfg_bool(self, section: str, key: str, default: bool = False) -> bool:
+        return self.config.cfg_bool(section, key, default)
+
+    def cfg_array(self, section: str, key: str) -> list[str] | None:
+        return self.config.cfg_array(section, key)
+
+    def cfg_list(self, section: str, key: str) -> list[str]:
+        return self.config.cfg_list(section, key)
+
+    def require_cfg(self, *pairs: str) -> None:
+        self.config.require(*pairs)
+
+    # ------------------------------------------------------------------
+    # output
+    # ------------------------------------------------------------------
+    def log(self, *parts: object) -> None:
+        """Step narration. Shown only with -v, never in a dry-run listing."""
+        if self.verbose and not self.dry_run:
+            print(f"[{self.prefix}] {' '.join(str(p) for p in parts)}")
+
+    def say(self, *parts: object) -> None:
+        """Something the operator must see even on a quiet successful run."""
+        if not self.dry_run:
+            print(f"[{self.prefix}] {' '.join(str(p) for p in parts)}")
+
+    def out(self, *parts: object) -> None:
+        """Plain output (tables, summaries) -- suppressed under --dry-run."""
+        if not self.dry_run:
+            print(" ".join(str(p) for p in parts) if parts else "")
+
+    def warn(self, *parts: object) -> None:
+        self.warnings += 1
+        print(f"[{self.prefix}] WARNING: {' '.join(str(p) for p in parts)}",
+              file=sys.stderr)
+
+    def err(self, *parts: object) -> None:
+        print(f"[{self.prefix}] ERROR: {' '.join(str(p) for p in parts)}",
+              file=sys.stderr)
+
+    def note_stderr(self, text: str, indent: str = "        ") -> None:
+        for line in str(text).splitlines():
+            print(f"{indent}{line}", file=sys.stderr)
+
+    def die(self, *parts: object) -> "Abort":
+        """Raise, don't exit -- the CLI turns this into the exit status."""
+        raise Abort(" ".join(str(p) for p in parts))
+
+    def finish(self, *parts: object) -> None:
+        """The single success line. Call at the end of a successful run."""
+        if self.dry_run:
+            return
+        extra = f" ({self.changes} commands)" if self.changes > 0 else ""
+        msg = " ".join(str(p) for p in parts)
+        if self.warnings > 0:
+            print(f"[{self.prefix}] OK: {msg} -- {self.warnings} warning(s){extra}")
+        else:
+            print(f"[{self.prefix}] OK: {msg}{extra}")
+
+    def dr_head(self, *parts: object) -> None:
+        """Section heading, dry-run listings only."""
+        if self.dry_run:
+            print(f"\n# {' '.join(str(p) for p in parts)}")
+
+    def dr_banner(self, *parts: object) -> None:
+        if self.dry_run:
+            print(f"# {' '.join(str(p) for p in parts)}")
+            print("# Commands reflect the current state -- "
+                  "already-configured items are omitted.")
+
+    # ------------------------------------------------------------------
+    # command execution
+    # ------------------------------------------------------------------
+    def run(self, *argv: object, check: bool = False,
+            stdin: str | None = None) -> Result:
+        """A MUTATING command: printed under --dry-run, executed otherwise."""
+        cmd = [str(a) for a in argv]
+        if self.dry_run:
+            print(format_cmd(cmd))
+            return Result(0)
+        self.changes += 1
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, input=stdin, check=False
+            )
+        except FileNotFoundError:
+            res = Result(127, "", f"{cmd[0]}: command not found")
+            if check:
+                raise Abort(f"{cmd[0]}: command not found") from None
+            return res
+        res = Result(proc.returncode, (proc.stdout or "").strip(),
+                     (proc.stderr or "").strip())
+        if check and not res.ok:
+            raise Abort(
+                f"command failed ({res.returncode}): {format_cmd(cmd)}\n"
+                f"{res.stderr}"
+            )
+        return res
+
+    def q(self, *argv: object) -> Result:
+        """A read-only QUERY.
+
+        Never wrapped by dry-run: the printed command list has to reflect
+        what would actually change given the current state of the system,
+        which means the queries that decide that must really run.
+        """
+        cmd = [str(a) for a in argv]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        except FileNotFoundError:
+            return Result(127, "", f"{cmd[0]}: command not found")
+        return Result(proc.returncode, (proc.stdout or "").strip(),
+                      (proc.stderr or "").strip())
+
+    def qout(self, *argv: object) -> str:
+        """Query, returning stdout only ('' on failure)."""
+        return self.q(*argv).stdout
+
+    # ------------------------------------------------------------------
+    # preconditions
+    # ------------------------------------------------------------------
+    def require_root(self) -> None:
+        if self.dry_run or self.listing:
+            return
+        if os.geteuid() != 0:
+            raise Abort("must be run as root (try: sudo ovnctl ...)")
+
+    def require_cmd(self, *cmds: str) -> None:
+        if self.listing:
+            return
+        missing = [c for c in cmds if shutil.which(c) is None]
+        if missing:
+            raise Abort(f"required command(s) not found: {' '.join(missing)}")
+
+    @staticmethod
+    def have(cmd: str) -> bool:
+        return shutil.which(cmd) is not None
+
+    # ------------------------------------------------------------------
+    # systemd
+    # ------------------------------------------------------------------
+    def unit_exists(self, unit: str) -> bool:
+        """Does a systemd unit exist?
+
+        NOT "systemctl list-unit-files | grep -q": grep exits on the first
+        match, systemctl takes SIGPIPE, and the pipeline then reports
+        failure despite matching. Query the one unit and read the output.
+        """
+        if not self.have("systemctl"):
+            return False
+        res = self.q("systemctl", "list-unit-files", f"{unit}.service",
+                     "--no-legend", "--no-pager")
+        return bool(res.stdout.strip())
+
+    def unit_active(self, unit: str) -> bool:
+        if not self.have("systemctl"):
+            return False
+        return self.q("systemctl", "is-active", "--quiet", unit).ok
+
+
+def trace_verdict(output: str) -> str:
+    """ALLOW/DROP from an ovn-trace, in both stateless and stateful pipelines.
+
+    A stateless drop prints "drop;". But as soon as any ACL uses
+    allow-related the pipeline is stateful and northd compiles a drop into
+    "ct_commit { ct_mark.blocked = 1; }" with no next/output -- the packet
+    still dies, it just never prints "drop;". Matching only "drop;" reports
+    those as ALLOW, which is the worst direction to be wrong in.
+    """
+    if "ct_mark.blocked = 1" in output:
+        return "DROP"
+    for line in output.splitlines():
+        if re.match(r"^\s*drop;", line):
+            return "DROP"
+    return "ALLOW"
