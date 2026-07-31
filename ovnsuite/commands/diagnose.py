@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import re
 import subprocess
-from collections import Counter
 
 from .. import netcalc, ovn
 from ..context import Ctx
@@ -44,9 +43,6 @@ PASS = "[ OK ]"
 FAIL = "[FAIL]"
 WARN = "[WARN]"
 SKIP = "[SKIP]"
-
-_MAC_RE = re.compile(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}")
-_IP_RE = re.compile(r"(?:\d{1,3}\.){3}\d{1,3}")
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -833,177 +829,6 @@ class Diagnose:
                     self.skip(f"Tier {prio} ({label}): not configured, none present.")
 
     # ------------------------------------------------------------------
-    # 5g
-    # ------------------------------------------------------------------
-    def check_duplicate_delivery(self) -> None:
-        """Duplicate-delivery detection (the 'DUP!' symptom).
-
-        A ping answered twice means the request reached the target twice, or
-        two things replied. Every cause below also duplicates TCP segments,
-        so it degrades far more than ICMP.
-        """
-        ctx = self.ctx
-        self.section("5g. Duplicate delivery (DUP! causes)")
-        found = 0
-
-        found += self._dup_iface_ids()
-        found += self._dup_logical_addresses()
-        found += self._dup_inventory()
-        found += self._dup_additional_chassis()
-        found += self._dup_kernel_addresses()
-        found += self._dup_shared_segment()
-
-        if found == 0:
-            self.ok("No duplicate-delivery causes detected.")
-        else:
-            print("")
-            self.detail(
-                f"{found} probable cause(s) of 'DUP!' found above. To confirm which",
-                "leg duplicates, capture while pinging one VM:",
-                f"  tcpdump -nni {self.br_int} icmp        # OVN's view",
-                "  tcpdump -nni <vm tap> icmp        # request arriving twice?")
-
-    def _dup_iface_ids(self) -> int:
-        """Two OVS interfaces carrying one iface-id: OVN binds both and
-        delivers to both. Cloned domain XMLs are the usual origin."""
-        ctx = self.ctx
-        if not ctx.have("ovs-vsctl"):
-            return 0
-        out = ctx.qout("ovs-vsctl", "--bare", "--columns=external_ids", "list",
-                       "Interface")
-        ids = re.findall(r'iface-id=([^,}"\s]+)', out)
-        dupes = [k for k, n in Counter(ids).items() if n > 1]
-        if dupes:
-            self.bad("Duplicate iface-id on more than one local OVS interface:")
-            for d in dupes:
-                print(f"          {d}")
-            self.detail("Each of these logical ports is plugged in twice, so every",
-                        "packet to it is delivered twice. Fix the duplicated",
-                        "interfaceid in the libvirt domain XML.")
-            return 1
-        self.ok("No duplicate iface-id among local OVS interfaces.")
-        return 0
-
-    def _dup_logical_addresses(self) -> int:
-        ctx = self.ctx
-        if not ctx.have("ovn-nbctl"):
-            return 0
-        addrs = ctx.qout("ovn-nbctl", "--bare", "--columns=addresses", "list",
-                         "Logical_Switch_Port")
-        found = 0
-        macs = [m.lower() for m in _MAC_RE.findall(addrs)]
-        dup_mac = [k for k, n in Counter(macs).items() if n > 1]
-        if dup_mac:
-            self.bad("Duplicate MAC across logical switch ports:")
-            for d in dup_mac:
-                print(f"          {d}")
-            found += 1
-        else:
-            self.ok("No duplicate MAC among logical switch ports.")
-
-        ips = _IP_RE.findall(addrs)
-        dup_ip = [k for k, n in Counter(ips).items() if n > 1]
-        if dup_ip:
-            self.bad("Duplicate IP across logical switch ports:")
-            for d in dup_ip:
-                print(f"          {d}")
-            found += 1
-        else:
-            self.ok("No duplicate IP among logical switch ports.")
-        return found
-
-    def _dup_inventory(self) -> int:
-        """Catch it at the source, before it is ever applied."""
-        if not self.inv.all:
-            return 0
-        found = 0
-        for label, values in (("UUID", [v.uuid for v in self.inv.all]),
-                              ("MAC", [v.mac for v in self.inv.all]),
-                              ("IP", [v.ip for v in self.inv.all])):
-            dupes = [k for k, n in Counter(values).items() if n > 1]
-            if dupes:
-                self.bad(f"Duplicate {label} in yaml [vm_config]:")
-                for d in dupes:
-                    print(f"          {d}")
-                found += 1
-        if found == 0:
-            self.ok("yaml [vm_config] inventory has no duplicate UUID/MAC/IP.")
-        return found
-
-    def _dup_additional_chassis(self) -> int:
-        """additional_chassis exists for live migration; if it is populated
-        here, duplicate delivery is by design."""
-        ctx = self.ctx
-        if not ctx.have("ovn-sbctl"):
-            return 0
-        probe = ctx.q("ovn-sbctl", "--columns=additional_chassis", "list",
-                      "Port_Binding")
-        if not probe.ok:
-            return 0
-        found = 0
-        for lp in ovn.port_binding_ports(ctx):
-            extra = ctx.qout("ovn-sbctl", "--bare",
-                             "--columns=additional_chassis", "find",
-                             "Port_Binding", f"logical_port={lp}")
-            if extra.strip():
-                self.bad(f"Port '{lp}' has additional_chassis set ({extra}).")
-                self.detail("Traffic to it is delivered to more than one chassis.")
-                found += 1
-        if found == 0:
-            self.ok("No port binding has additional_chassis set.")
-        return found
-
-    def _dup_kernel_addresses(self) -> int:
-        """An IP left on a bridge or its physical member means the kernel
-        answers alongside OVN."""
-        ctx = self.ctx
-        found = 0
-        for ifn in (self.br_internal, self.br_asa, self.nic_internal,
-                    self.nic_asa):
-            if not ifn:
-                continue
-            if not ctx.q("ip", "link", "show", ifn).ok:
-                continue
-            if "inet " in ctx.qout("ip", "-4", "addr", "show", "dev", ifn):
-                self.bad(f"{ifn} has a kernel IPv4 address but OVN should own "
-                         "this path.")
-                self.block(ctx.qout("ip", "-br", "-4", "addr", "show", "dev", ifn))
-                self.detail("The kernel will reply alongside OVN. Remove it, and set the",
-                            "NIC unmanaged in NetworkManager so it does not come back.")
-                found += 1
-        return found
-
-    def _dup_shared_segment(self) -> int:
-        """A MAC learned on both bridges means frames flooded out one come
-        back in the other."""
-        ctx = self.ctx
-        if not self.br_asa or not ctx.have("ovs-appctl"):
-            return 0
-        if not (ovn.br_exists(ctx, self.br_internal)
-                and ovn.br_exists(ctx, self.br_asa)):
-            return 0
-
-        def fdb(bridge: str) -> set[str]:
-            out = ctx.qout("ovs-appctl", "fdb/show", bridge)
-            macs = set()
-            for line in out.splitlines()[1:]:
-                parts = line.split()
-                if len(parts) >= 2:
-                    macs.add(parts[1])
-            return macs
-
-        both = fdb(self.br_internal) & fdb(self.br_asa)
-        if both:
-            self.bad(f"MAC(s) learned on BOTH {self.br_internal} and {self.br_asa}:")
-            for m in sorted(both):
-                print(f"          {m}")
-            self.detail("The two uplink NICs appear to share a physical segment, so",
-                        "flooded frames loop back in. Separate the VLANs/switch ports.")
-            return 1
-        self.ok("No MAC learned on both uplink bridges.")
-        return 0
-
-    # ------------------------------------------------------------------
     # 6
     # ------------------------------------------------------------------
     def check_flows(self) -> None:
@@ -1120,8 +945,6 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     runner.add("port-security", "VM port security", d.check_port_security)
     runner.add("range-overlap", "range overlap and policy tiers",
                d.check_range_overlap)
-    runner.add("duplicate-delivery", "causes of duplicated packets",
-               d.check_duplicate_delivery)
     runner.add("flows", "OpenFlow rules on br-int", d.check_flows)
     runner.add("host-if", "the host-facing OVS interface", d.check_host_if)
     runner.add("live-arp", "live ARP/ping test of the gateway", d.check_live_arp)
