@@ -118,18 +118,40 @@ class Setup:
         if not id_changed:
             return
 
-        # ovn-controller reads system-id once, at startup. If it is already
-        # running it is still registered under the OLD name, so leaving it
-        # alone would leave the host with a chassis nothing matches.
         self.identity_changed = True
-        if ctx.q("pgrep", "-x", "ovn-controller").ok or ctx.dry_run:
-            ctx.warn("system-id changed while ovn-controller was running -- "
-                     "restarting it so it re-registers.")
-            identity.restart_controller(ctx, "system-id changed")
-            if not identity.wait_for_chassis(ctx, self.system_id):
-                ctx.warn(f"ovn-controller has not registered as "
-                         f"'{self.system_id}' yet -- later steps that need a "
-                         "chassis may fail; re-run if so.")
+
+        # DO NOT restart first. ovn-controller usually notices a system-id
+        # change on its own and re-registers within a few seconds, and a
+        # restart here is expensive in a way that is easy to miss: it lands
+        # in the middle of a deploy, `ovn-ctl stop` regularly fails to exit
+        # cleanly and gets SIGKILLed, and the replacement process then has
+        # to rebuild its entire view -- several hundred thousand flows on
+        # this deployment. During that rebuild it claims nothing, so
+        # vm-attach a few stages later finds running VMs unbound and blames
+        # the controller.
+        #
+        # This path is hit on every deploy after `delete --purge-db`,
+        # because teardown clears external-ids and so system-id always
+        # "changes". Restarting unconditionally there turned a working
+        # deploy into one that needed a second vm-attach run.
+        if identity.wait_for_chassis(ctx, self.system_id, timeout=20):
+            ctx.log(f"ovn-controller registered as '{self.system_id}' without "
+                    "a restart.")
+            return
+
+        if not (ctx.q("pgrep", "-x", "ovn-controller").ok or ctx.dry_run):
+            ctx.log("ovn-controller is not running -- nothing to restart.")
+            return
+
+        ctx.warn(f"ovn-controller did not register as '{self.system_id}' "
+                 "within 20s of the change --")
+        ctx.warn("restarting it. Expect the first port claims to be slow "
+                 "while it rebuilds.")
+        identity.restart_controller(ctx, "system-id changed")
+        if not identity.wait_for_chassis(ctx, self.system_id, timeout=60):
+            ctx.warn(f"ovn-controller has not registered as "
+                     f"'{self.system_id}' yet -- later steps that need a "
+                     "chassis may fail; re-run if so.")
 
         leftovers = identity.stale(ctx, self.system_id)
         if leftovers:

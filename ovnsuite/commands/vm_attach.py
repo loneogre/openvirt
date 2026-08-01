@@ -268,6 +268,16 @@ class VMAttach:
         conn = ctx.qout("ovn-appctl", "-t", "ovn-controller",
                         "connection-status").strip()
         ctx.warn(f"      SB connection       : {conn or 'unknown'}")
+        if not conn:
+            # An empty answer usually means the controller is too busy to
+            # service its control socket -- which on this deployment means
+            # it is rebuilding, and a rebuilding controller claims nothing.
+            ctx.warn("      -> the control socket did not answer. That "
+                     "normally means")
+            ctx.warn("         ovn-controller is still rebuilding its "
+                     "flow table. Wait, then")
+            ctx.warn("         re-run `ovnctl vm-attach`; it is not stuck, "
+                     "just busy.")
 
         local_id = ovn.external_id(ctx, "system-id").strip()
         registered = ovn.chassis_names(ctx)

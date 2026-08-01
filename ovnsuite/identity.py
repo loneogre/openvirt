@@ -202,10 +202,11 @@ def restart_controller(ctx: Ctx, reason: str = "") -> bool:
 def wait_for_chassis(ctx: Ctx, name: str, timeout: int = 30) -> bool:
     """Block until <name> appears in the SB db, or give up.
 
-    A restarted ovn-controller takes a second or two to connect and
-    register. Anything that checks immediately afterwards -- re-pinning a
-    gateway, reporting success -- would otherwise decide the identity is
-    still broken and refuse to do its job.
+    Used for two different questions, both of which need patience rather
+    than action: "has the controller finished starting?" and "has it
+    noticed the system-id I just changed?". A restart is the last resort
+    for the second one, not the first response -- see setup.external_ids
+    for why an unnecessary restart is expensive.
     """
     if ctx.dry_run:
         return True
