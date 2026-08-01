@@ -316,14 +316,40 @@ class Ctx:
         return self.q("systemctl", "is-active", "--quiet", unit).ok
 
 
+# Every shape northd compiles an ACL drop into. There are more than one,
+# and which you get depends on options that have nothing to do with the
+# verdict:
+#
+#   drop;                          stateless pipeline, unnamed ACL
+#   ct_commit { ct_mark.blocked = 1; }
+#                                  stateful pipeline, established branch
+#   log(... verdict=drop); /* drop */
+#                                  once the ACL carries a name or logging,
+#                                  northd emits the log action and leaves
+#                                  the drop implicit -- as a COMMENT. On the
+#                                  new-connection branch (reg0[9]) there is
+#                                  no ct_commit either, so NEITHER of the
+#                                  first two forms appears anywhere.
+#
+# That last case is why naming the ACLs made every isolation check report
+# "not blocked" on a deployment that was enforcing correctly: the drop was
+# real, the packet died, and the only textual evidence was a C comment.
+_DROP_MARKERS = (
+    "ct_mark.blocked = 1",
+    "/* drop */",
+    "/* reject */",
+    "verdict=drop",
+    "verdict=reject",
+)
+
+
 def trace_verdict(output: str) -> str:
     """ALLOW / DROP / UNKNOWN from an ovn-trace.
 
-    A stateless drop prints "drop;". But as soon as any ACL uses
-    allow-related the pipeline is stateful and northd compiles a drop into
-    "ct_commit { ct_mark.blocked = 1; }" with no next/output -- the packet
-    still dies, it just never prints "drop;". Matching only "drop;" reports
-    those as ALLOW, which is the worst direction to be wrong in.
+    A drop reaches the trace in one of several forms depending on whether
+    the pipeline is stateful and whether the ACL is named or logged -- see
+    _DROP_MARKERS. Matching only "drop;" reports the others as ALLOW,
+    which is the worst direction to be wrong in.
 
     UNKNOWN exists because this used to return ALLOW for ANY output it did
     not recognise -- including empty output. A trace that timed out, hit a
@@ -343,10 +369,10 @@ def trace_verdict(output: str) -> str:
     for line in text.splitlines():
         if line.startswith("ovn-trace:") or line.startswith("timed out"):
             return "UNKNOWN"
-    if "ct_mark.blocked = 1" in output:
+    if any(marker in output for marker in _DROP_MARKERS):
         return "DROP"
     for line in output.splitlines():
-        if re.match(r"^\s*drop;", line):
+        if re.match(r"^\s*(drop|reject)\s*[;{]", line.strip()):
             return "DROP"
     if "ingress(dp=" not in output:
         return "UNKNOWN"
