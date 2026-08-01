@@ -34,6 +34,7 @@ MODULES = (
     "vm_config",
     "vm_isolation",
     "acl",
+    "user_vm",
     "vm_attach",
     "pcap",
     "reconcile",

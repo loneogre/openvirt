@@ -54,7 +54,7 @@ STAGES = (
     # leave those VMs silently disconnected with no error anywhere. It is
     # a no-op when nothing is allocated.
     ("user-vm", ["user-vm", "--reapply"], REQUIRED,
-     "user-VM segment and allocated slots"),
+     "user-VM slots recorded in state/user-vms.json"),
     # Host-side helpers. These depend on things outside OVN (libvirt,
     # tcpdump, running VMs) and are expected to no-op on some hosts.
     ("vm-attach", ["vm-attach"], OPTIONAL,
@@ -139,7 +139,12 @@ class Deploy:
             return int(exc.code or 0)
 
     def stage(self, label: str, argv: list[str], kind: str) -> None:
-        self.banner(" ".join(argv))
+        # The stage's own name, not its argv. A stage whose command needs a
+        # flag ("user-vm --reapply") otherwise announces itself as
+        # something the operator did not ask for and has never run, which
+        # reads as the deploy doing something surprising rather than as a
+        # step with an unfortunate flag name.
+        self.banner(label)
         rc = self._invoke(argv)
         if rc == 0:
             self.ok.append(label)
