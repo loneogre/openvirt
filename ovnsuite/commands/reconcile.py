@@ -240,6 +240,34 @@ class Reconcile:
         identity.restart_controller(ctx, "claim locally plugged ports")
 
     # -- 6 ---------------------------------------------------------------
+    def acl_logging(self) -> None:
+        """Re-apply the acl_log vlog level.
+
+        ovn-controller's vlog levels are runtime state: they are set by
+        ovn-appctl and forgotten at the next restart. Every ACL still says
+        log=true afterwards, so nothing looks wrong -- the records simply
+        stop arriving. Since this command already runs at boot and after
+        any controller restart, it is the right place to re-assert it.
+        """
+        ctx = self.ctx
+        ctx.dr_head("ACL logging")
+        if not ctx.have("ovn-appctl"):
+            return
+        # Only if something actually logs. Raising the level otherwise
+        # costs nothing but says something misleading in the output.
+        if not any(row.get("log") for row in ovn.acl_index(ctx).values()):
+            ctx.log("No ACL has logging enabled -- nothing to re-assert.")
+            return
+        severity = ctx.config.cfg_opt("acl_log", "severity", "info")
+        if ctx.run("ovn-appctl", "-t", "ovn-controller", "vlog/set",
+                   f"acl_log:syslog:{severity}"):
+            ctx.log(f"acl_log vlog level re-applied ({severity}).")
+        else:
+            ctx.warn("Could not re-apply the acl_log vlog level; ACL records "
+                     "may not reach syslog until `ovnctl acl --only "
+                     "log-sink` is run.")
+
+    # -- 7 ---------------------------------------------------------------
     def refresh_tracker(self) -> None:
         """Stamp the tracker with the current boot id.
 
@@ -355,6 +383,8 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
                cmd.host_interface)
     runner.add("claim-check", "restart ovn-controller if a tap went unclaimed",
                cmd.claim_check)
+    runner.add("acl-logging", "re-assert the acl_log vlog level",
+               cmd.acl_logging)
     runner.add("tracker", "stamp the tracker with this boot id",
                cmd.refresh_tracker)
 

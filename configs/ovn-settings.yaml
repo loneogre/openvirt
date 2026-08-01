@@ -407,8 +407,8 @@ acls:
   rules:
     # --- management SSH in, no lateral SSH -----------------------------
     - "ssh-mgmt-in     to-lport   2000 allow-related pg_vms src=172.31.1.8/30,172.31.0.0/27 tcp=22"
-    - "ssh-lateral-in  to-lport   1900 drop          pg_vms src=any                         tcp=22"
-    - "ssh-lateral-out from-lport 1900 drop          pg_vms dst=internal                    tcp=22"
+    - "ssh-lateral-in  to-lport   1900 drop          pg_vms src=any                         tcp=22 log"
+    - "ssh-lateral-out from-lport 1900 drop          pg_vms dst=internal                    tcp=22 log"
 
     # --- FreeIPA domain join: ext-vm2 (.35) -> int-vm4 (.30) ------------
     # Priority 2100 so these survive a future default-deny for lateral
@@ -442,6 +442,62 @@ acls:
     - "wks-dns     172.31.0.5  172.31.1.30 udp  53  ALLOW"
     - "wks-ping    172.31.0.5  172.31.1.30 icmp -   ALLOW"
     - "wks-ssh     172.31.0.5  172.31.1.30 tcp  22  ALLOW"
+
+
+# ----------------------------------------------------------------------------
+# [acl_log] -- where ACL log records go, and how fast they may arrive.
+#
+# LOGGING IS PER RULE, and off unless the rule asks for it. Append one of
+# these tokens to a rule in [acls].rules:
+#
+#   log            log every packet the rule matches, at .severity below
+#   log=notice     the same, at a specific severity
+#                  (alert | warning | notice | info | debug)
+#   meter=NAME     rate-limit this rule with a named meter of its own
+#   nolog          explicit off, for a rule you are toggling
+#
+# e.g.  - "ssh-lateral-in to-lport 1900 drop pg_vms src=any tcp=22 log"
+#
+# Log DROP rules freely -- they should rarely fire, and when they do you
+# want the record. Think hard before logging an ALLOW rule on a busy
+# segment: it writes a line per packet, to the same disk the captures go
+# to. The meter below is applied to every logging rule for that reason.
+#
+# HOW THE DIRECTORY IS IMPLEMENTED. OVN has no per-ACL log destination.
+# log=true makes ovn-controller emit the record through its own vlog, and
+# that is all OVN offers -- the records land wherever ovn-controller logs,
+# mixed in with everything else it says. So `ovnctl acl` does two things:
+#   1. ovn-appctl vlog/set acl_log:syslog:<severity>
+#   2. writes /etc/rsyslog.d/10-ovn-acl.conf, filing anything containing
+#      'acl_log' into <directory>/<filename> and stopping it there, so it
+#      does not also fill /var/log/messages
+#
+# Set manage_sink: false to keep the per-rule logging but configure the
+# destination yourself. Records then stay in ovn-controller's log:
+#   journalctl -u ovn-controller | grep acl_log
+#
+# NOTE: the vlog level is RUNTIME state and does not survive an
+# ovn-controller restart. `ovnctl reconcile` re-applies it at boot; if you
+# restart the controller by hand, re-run `ovnctl acl --only log-sink` or
+# the logging stops while the ACLs still claim log=true.
+#
+# Rotation is not configured here -- add a logrotate drop-in for the file
+# below if you expect volume.
+# ----------------------------------------------------------------------------
+acl_log:
+  directory: /var/log/ovn-acl
+  filename: acl.log
+  # Default severity for a rule that says bare 'log'.
+  severity: info
+  # Rate limit applied to every logging rule that does not name its own
+  # meter. Packets over the limit are still dropped/allowed as the ACL
+  # says -- only the LOG RECORD is discarded.
+  meter: acl-log-meter
+  rate_pps: 100
+  burst: 50
+  # false = do not touch rsyslog or the vlog level; per-rule log=true is
+  # still applied and records stay in ovn-controller's log.
+  manage_sink: true
 
 # ----------------------------------------------------------------------------
 # [vm_names] -- optional. Maps an inventory name from [vm_config] to the
@@ -595,11 +651,11 @@ pcap:
   # the capture file is created, so each pcap is born owned by this account
   # and its primary group; nothing chowns it afterwards. `--start` prints
   # the effective uid:gid so you can confirm what the files will look like.
-  drop_user: ovnpcap
+  drop_user: tcpdump
   min_free_mb: 2048         # warn below this
   # true  -> <directory>/<vm>/<file>
   # false -> everything flat in <directory>
-  subdirs: true
+  subdirs: false
   # Filenames are:
   #   <file_prefix>_<virsh-vm-name>_<capture-interface>_<YYYYMMDDHHMMSS>.pcap
   # e.g. internal_velociraptor-prod_mir-extvm3_20260730143022.pcap

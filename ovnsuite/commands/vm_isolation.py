@@ -285,9 +285,9 @@ class VMIsolation:
             entry = index.get(key)
             if not entry:
                 continue
-            uuid, current = entry
-            if current == name:
+            if entry.get("name") == name:
                 continue
+            uuid = entry["uuid"]
             if not ctx.run("ovn-nbctl", "set", "acl", uuid, f"name={name}"):
                 ctx.warn(f"Could not set name '{name}' on ACL {uuid}.")
 

@@ -223,22 +223,29 @@ def pg_snapshot(ctx: Ctx) -> dict[str, PortGroup]:
     return groups
 
 
-def acl_index(ctx: Ctx) -> dict[tuple[str, str, str], tuple[str, str]]:
-    """(direction, priority, match) -> (row uuid, current name).
+def acl_index(ctx: Ctx) -> dict[tuple[str, str, str], dict]:
+    """(direction, priority, match) -> the row's presentation columns.
 
     That triple is what ovn-nbctl's --may-exist treats as an ACL's
     identity, so it is the right key for "have I already created this
-    one, and does it carry the name I meant it to?".
+    one, and does it carry the name, logging and meter I meant it to?".
     """
-    index: dict[tuple[str, str, str], tuple[str, str]] = {}
-    for row in nb_json(ctx, "_uuid,direction,priority,match,name", "ACL"):
-        if len(row) < 5:
+    index: dict[tuple[str, str, str], dict] = {}
+    cols = "_uuid,direction,priority,match,name,log,severity,meter"
+    for row in nb_json(ctx, cols, "ACL"):
+        if len(row) < 8:
             continue
         uuids = uuid_list(row[0])
         if not uuids:
             continue
         key = (str(row[1] or ""), str(row[2]), str(row[3] or ""))
-        index[key] = (uuids[0], _scalar(row[4]))
+        index[key] = {
+            "uuid": uuids[0],
+            "name": _scalar(row[4]),
+            "log": row[5] is True,
+            "severity": _scalar(row[6]),
+            "meter": _scalar(row[7]),
+        }
     return index
 
 
@@ -259,16 +266,29 @@ _acl_name_unsupported = False
 
 
 def add_acl(ctx: Ctx, group: str, direction: str, priority, match: str,
-            action: str, name: str = "") -> None:
-    """`ovn-nbctl acl-add` against a port group, carrying a name.
+            action: str, name: str = "", log: bool = False,
+            severity: str = "", meter: str = "") -> None:
+    """`ovn-nbctl acl-add` against a port group, with its presentation
+    options.
 
     The name is what `ovnctl show` and `ovn-nbctl acl-list` print. Without
     it every rule displays as '-' and the only way to tell two ACLs apart
     is to read their match strings, which is exactly the situation the
     declarative rule names exist to avoid.
+
+    log/severity/meter turn on ovn-controller's acl_log output for this
+    one ACL. The name matters twice over once logging is on: it is the
+    identifier that appears in every log line, so an unnamed logging ACL
+    produces records nobody can trace back to a rule.
     """
     global _acl_name_unsupported
     head = ["ovn-nbctl", "--may-exist", "--type=port-group"]
+    if log:
+        head.append("--log")
+        if severity:
+            head.append(f"--severity={severity}")
+        if meter:
+            head.append(f"--meter={meter}")
     tail = ["acl-add", group, direction, str(priority), match, action]
 
     if name and not _acl_name_unsupported:
