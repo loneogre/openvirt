@@ -417,10 +417,41 @@ class UserVM:
         ctx.run("ovn-nbctl", "lsp-set-port-security", port_uuid, f"{mac} {ip}")
         ctx.run("ovn-nbctl", "set", "Logical_Switch_Port", port_uuid,
                 f"external-ids:vm-name={name}")
-        ctx.run("ovn-nbctl", "--if-exists", "pg-set-ports", self.pg_name,
-                *[r["uuid"] for r in self.records()] + [port_uuid])
+        self.sync_pg_members(extra=port_uuid)
 
         self.access_acls(name, port_uuid, access)
+
+    def sync_pg_members(self, extra: str = "",
+                        only: list[str] | None = None) -> None:
+        """Set the port group's membership to exactly the allocated slots.
+
+        NOT `--if-exists`: ovn-nbctl does not accept that option on
+        pg-set-ports and rejects the whole command, which is how the group
+        ended up with 35 ACLs and zero members -- every rule compiled
+        against an empty group, so nothing was isolated and nothing was
+        reachable. Same mistake as `--may-exist pg-add`; both were silent
+        because the failure was never checked.
+
+        Membership is set wholesale rather than added to, so a slot
+        released outside this command cannot linger in the group.
+        """
+        ctx = self.ctx
+        if only is not None:
+            members = list(only)
+        else:
+            members = [r["uuid"] for r in self.records()]
+            if extra and extra not in members:
+                members.append(extra)
+
+        res = ctx.run("ovn-nbctl", "pg-set-ports", self.pg_name, *members)
+        if not res:
+            ctx.warn(f"Could not set members on {self.pg_name}: "
+                     f"{res.stderr.splitlines()[0] if res.stderr else '?'}")
+            ctx.warn("The ACLs on that group match nothing until this "
+                     "succeeds -- the slots are neither isolated nor "
+                     "reachable.")
+            return
+        ctx.log(f"{self.pg_name} membership: {len(members)} port(s).")
 
     def access_acls(self, name: str, port_uuid: str,
                     access: list[str]) -> None:
@@ -473,8 +504,7 @@ class UserVM:
 
         remaining = [r["uuid"] for r in self.records() if r["name"] != name]
         if remaining:
-            ctx.run("ovn-nbctl", "--if-exists", "pg-set-ports", self.pg_name,
-                    *remaining)
+            self.sync_pg_members(only=remaining)
         else:
             # KEEP the empty port group and its ACLs.
             #
@@ -487,7 +517,7 @@ class UserVM:
             #
             # An empty group costs nothing: its ACLs match `@pg_user_vms`,
             # which resolves to no ports, so they compile to nothing.
-            ctx.run("ovn-nbctl", "--if-exists", "pg-set-ports", self.pg_name)
+            self.sync_pg_members(only=[])
             ctx.log(f"{self.pg_name} is now empty; its ACLs are kept so the "
                     "segment stays complete.")
 

@@ -239,8 +239,26 @@ class Diagnose:
                         "not from configuration -- the usual cause of memory",
                         "that does not match the topology.")
         else:
-            self.detail("Nothing here explains it, which points at the daemon:",
-                        "  ovn-controller --version")
+            self.detail("Nothing here explains it, which points at the daemon.")
+
+        # The logical-flow cache is the usual answer when the row counts do
+        # not account for the memory: it fills when a datapath's flows are
+        # computed, and on OVN 22.x it has no limit unless one is set.
+        limit = ovn.external_id(self.ctx, "ovn-memlimit-lflow-cache-kb").strip()
+        self.detail(f"lflow cache limit (ovn-memlimit-lflow-cache-kb): "
+                    f"{limit or 'UNSET -- unlimited'}")
+        stats = ovn.lflow_cache_stats(self.ctx)
+        if stats:
+            for line in stats.splitlines()[:8]:
+                self.detail(f"  {line}")
+        elif not limit:
+            self.detail(
+                "Cache stats unavailable (the control socket is not"
+                " answering).",
+                "With no limit set, capping it is the cheapest thing to try:",
+                "  ovs-vsctl set open . "
+                "external-ids:ovn-memlimit-lflow-cache-kb=131072",
+                "  systemctl restart ovn-controller")
 
     def check_controller_service(self) -> None:
         ctx = self.ctx
@@ -919,6 +937,75 @@ class Diagnose:
     # ------------------------------------------------------------------
     # 5i
     # ------------------------------------------------------------------
+    def check_user_vms(self) -> None:
+        """Do the allocated slots actually sit in their port group?
+
+        This exists because of a specific silent failure: the port group
+        had every ACL and ZERO members, so all of them compiled against
+        nothing. The slots were neither isolated from each other nor
+        reachable from the management source, and every other view --
+        `show`, the ACL listing, the allocation file -- looked correct.
+        Membership is the one thing that ties the two together, so it is
+        the one thing worth checking.
+        """
+        import json
+        from .. import paths
+
+        ctx = self.ctx
+        self.section("5j. User-VM segment")
+
+        path = paths.state_dir() / "user-vms.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.skip("No user-VM allocations recorded.")
+            return
+        slots = data.get("slots") or {}
+        pg_name = ctx.config.cfg_opt("user_vms", "pg_name", "pg_user_vms")
+
+        if not slots:
+            if ovn.pg_exists(ctx, pg_name):
+                self.ok(f"No slots allocated; {pg_name} exists and is empty "
+                        "(expected).")
+            else:
+                self.skip("No slots allocated and no port group -- the "
+                          "segment has never been built.")
+            return
+
+        if not ovn.pg_exists(ctx, pg_name):
+            self.bad(f"{len(slots)} slot(s) allocated but {pg_name} does not "
+                     "exist.")
+            self.detail("Nothing is isolating them. -> ovnctl user-vm --reapply")
+            return
+
+        members = set(ovn.pg_members(ctx, pg_name))
+        wanted = {r["uuid"] for r in slots.values() if r.get("uuid")}
+        missing = wanted - members
+        extra = members - wanted
+
+        if missing:
+            self.bad(f"{len(missing)} allocated slot(s) are NOT in {pg_name}:")
+            for uuid in sorted(missing):
+                name = next((n for n, r in slots.items()
+                             if r.get("uuid") == uuid), "?")
+                self.detail(f"{name} ({uuid})")
+            self.detail(
+                "Their ACLs match a group they are not in, so they are",
+                "neither isolated from each other nor reachable from the",
+                "management source.",
+                "-> ovnctl user-vm --reapply")
+        else:
+            self.ok(f"All {len(wanted)} allocated slot(s) are members of "
+                    f"{pg_name}.")
+
+        if extra:
+            self.note(f"{len(extra)} port(s) in {pg_name} are not allocated "
+                      "slots:")
+            for uuid in sorted(extra):
+                self.detail(uuid)
+            self.detail("Left over from a slot released outside `user-vm "
+                        "--delete`. -> ovnctl user-vm --reapply")
+
     def check_port_security(self) -> None:
         """lsp-set-port-security binds a port to its MAC+IP.
 
@@ -1260,6 +1347,7 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
                d.check_isolation)
     runner.add("acls", "micro-segmentation ACLs", d.check_acls)
     runner.add("port-security", "VM port security", d.check_port_security)
+    runner.add("user-vms", "user-VM segment membership", d.check_user_vms)
     runner.add("range-overlap", "range overlap and policy tiers",
                d.check_range_overlap)
     runner.add("flows", "OpenFlow rules on br-int", d.check_flows)
