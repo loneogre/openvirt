@@ -307,6 +307,12 @@ policy:
   priority_external: 150
   priority_split: 100
   external_only_ips:
+    # DO NOT add ext-vm1 (172.31.1.34) here, even though it is now in
+    # [vm_isolation].isolated_vms. Tier 300 ignores the destination and
+    # reroutes EVERYTHING from a listed source to the ASA -- including the
+    # replies to an SSH session from the workstation LAN, which would
+    # never come back. Its isolation is enforced at the ACL layer only,
+    # which is what leaves room for the exception.
     - "172.31.1.36"
     - "172.31.1.37"
     - "172.31.1.38"
@@ -354,6 +360,12 @@ vm_isolation:
   legacy_pg_names:
     - "pg-isolated"
   isolated_vms:
+    # ext-vm1 is isolated like the rest, but is reachable by SSH from the
+    # workstation LAN. That exception is a rule in [acls] (pg_ext_mgmt),
+    # NOT a change here -- membership of this group is what denies it
+    # everything else, and the exception has to sit at a higher priority
+    # than this group's drops rather than carving a hole in them.
+    - "ext-vm1 b4d8b36b-4bd3-4ec9-80e9-0434c18b46fa 172.31.1.34"
     - "ext-vm3 19b357ac-05ba-4124-8536-9c24053803ee 172.31.1.36"
     - "ext-vm4 91b7bdad-56b3-4a1b-9e48-e6485cc4215c 172.31.1.37"
     - "ext-vm5 6969ab22-1828-40c1-8fed-aa2f5a530e0c 172.31.1.38"
@@ -389,7 +401,7 @@ vm_isolation:
 # allow rule for them would punch a hole in that.
 # ----------------------------------------------------------------------------
 acls:
-  enabled: false
+  enabled: true
 
   # Named port sets, referenced from a rule as tcp=@name / udp=@name.
   # FreeIPA client enrolment (ipa-client-install) needs all of these.
@@ -403,12 +415,31 @@ acls:
     - "pg_vms all-except-isolated"
     - "pg_ipa_client ips=172.31.1.35"
     - "pg_ipa_server ips=172.31.1.30"
+    # ext-vm1 only. Isolated, but SSH-able from the workstation LAN.
+    - "pg_ext_mgmt names=ext-vm1"
 
   rules:
     # --- management SSH in, no lateral SSH -----------------------------
     - "ssh-mgmt-in     to-lport   2000 allow-related pg_vms src=172.31.1.8/30,172.31.0.0/27 tcp=22"
     - "ssh-lateral-in  to-lport   1900 drop          pg_vms src=any                         tcp=22 log"
     - "ssh-lateral-out from-lport 1900 drop          pg_vms dst=internal                    tcp=22 log"
+
+    # --- ext-vm1: isolated, but SSH in from the workstation LAN ---------
+    # Priority 1100 > [vm_isolation].acl_priority (1000), which is what
+    # makes this an exception to the isolation drops rather than a
+    # separate policy. Keep it above that number and below 1900 if you
+    # ever move ext-vm1 back into pg_vms.
+    #
+    # 172.31.0.0/27 ONLY. Note this is deliberately narrower than
+    # ssh-mgmt-in above, which also admits the host segment
+    # (172.31.1.8/30) -- the host must not be able to SSH this VM.
+    #
+    # allow-related is required, not cosmetic: the reply travels OUT of
+    # ext-vm1 towards 172.31.0.0/27, which is in [internal_ranges] and so
+    # is dropped by the isolation from-lport rule. allow-related puts the
+    # flow in conntrack and the reply is matched by OVN's built-in
+    # established/reply rules long before that drop is reached.
+    - "extvm1-ssh-in  to-lport   1100 allow-related pg_ext_mgmt src=172.31.0.0/27 tcp=22 log"
 
     # --- FreeIPA domain join: ext-vm2 (.35) -> int-vm4 (.30) ------------
     # Priority 2100 so these survive a future default-deny for lateral
@@ -544,7 +575,17 @@ vm_names:
 # it there is nothing to mirror and --start refuses rather than creating
 # ports that would capture nothing.
 #
-# targets: all | internal | external | isolated | all-except-isolated
+# targets: the same selector syntax as [acls].port_groups --
+#
+#   all | internal | external | isolated | all-except-isolated
+#   names=ext-vm1,int-vm3        specific VMs from [vm_config]
+#   ips=172.31.1.34              the same, by address
+#
+# 'isolated' tracks [vm_isolation].isolated_vms, so a VM added there is
+# captured from the next --start with no change here. Use names= or ips=
+# when the capture set is deliberately NOT the isolation set -- e.g.
+# capturing one VM during an investigation without isolating it, or
+# isolating a VM you have no reason to record.
 #          names=ext-vm3,ext-vm4   ips=172.31.1.36,172.31.1.37
 #
 # Layout with subdirs enabled:
@@ -587,6 +628,7 @@ pcap:
   # else. Defaults are fine.
   inflight_dir: inflight
   completed_dir: completed
+  # Currently: ext-vm1, ext-vm3, ext-vm4, ext-vm5, ext-vm6.
   targets: isolated
   snaplen: 0                # 0 = whole packet; 96 for headers only
   filter: ""                # optional BPF, e.g. "not port 22"
