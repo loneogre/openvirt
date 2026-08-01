@@ -525,13 +525,48 @@ CTL_DIRS = ("/run/ovn", "/var/run/ovn", "/run/openvswitch",
 
 
 def controller_ctl(ctx: Ctx) -> str:
-    """Full path to ovn-controller's control socket ('' if not found)."""
+    """Full path to the RUNNING ovn-controller's control socket.
+
+    Matched to the live pid, not just globbed. A controller that was
+    SIGKILLed -- which is what happens when `ovn-ctl stop` times out --
+    leaves its socket file behind, so the directory accumulates sockets
+    belonging to dead processes. Picking one of those produces "failed to
+    connect", which reads as "the controller is not answering" when in
+    fact nobody asked it.
+    """
     import glob
+    pids = ctx.qout("pgrep", "-x", "ovn-controller", timeout=5).split()
+    for pid in pids:
+        for base in CTL_DIRS:
+            path = f"{base}/ovn-controller.{pid}.ctl"
+            if Path(path).exists():
+                return path
+
+    # No live pid, or its socket is somewhere unexpected: fall back to the
+    # most RECENTLY MODIFIED socket rather than the highest-numbered one.
+    # Pids wrap, so lexical order says nothing about which is current.
+    candidates: list[str] = []
     for base in CTL_DIRS:
-        found = sorted(glob.glob(f"{base}/ovn-controller.*.ctl"))
-        if found:
-            return found[-1]
-    return ""
+        candidates.extend(glob.glob(f"{base}/ovn-controller.*.ctl"))
+    if not candidates:
+        return ""
+    try:
+        return max(candidates, key=lambda p: Path(p).stat().st_mtime)
+    except OSError:
+        return candidates[-1]
+
+
+def stale_ctl_sockets(ctx: Ctx) -> list[str]:
+    """Socket files whose owning process no longer exists."""
+    import glob
+    live = set(ctx.qout("pgrep", "-x", "ovn-controller", timeout=5).split())
+    stale: list[str] = []
+    for base in CTL_DIRS:
+        for path in glob.glob(f"{base}/ovn-controller.*.ctl"):
+            pid = path.rsplit(".", 2)[-2]
+            if pid not in live:
+                stale.append(path)
+    return stale
 
 
 def appctl(ctx: Ctx, *args: object, timeout: float = 10):

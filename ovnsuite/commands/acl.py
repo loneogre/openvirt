@@ -269,6 +269,12 @@ class ACLManager:
                 ctx.warn(f"  socket: {ovn.controller_ctl(ctx) or 'NOT FOUND'}")
                 if res.stderr:
                     ctx.warn(f"  ovn-appctl: {res.stderr.splitlines()[0]}")
+                stale = ovn.stale_ctl_sockets(ctx)
+                if stale:
+                    ctx.warn(f"  {len(stale)} socket file(s) belong to dead "
+                             "processes and can be removed:")
+                    for path in stale[:3]:
+                        ctx.warn(f"    rm -f {path}")
                 ctx.warn("  ACL logging is enabled on the rules regardless; "
                          "only the vlog")
                 ctx.warn("  level is unset, so records may not reach syslog.")

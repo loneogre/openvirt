@@ -450,10 +450,20 @@ class UserVM:
             ctx.run("ovn-nbctl", "--if-exists", "pg-set-ports", self.pg_name,
                     *remaining)
         else:
-            # An empty port group is not harmless: its ACLs still exist and
-            # northd keeps compiling them against nothing.
-            ctx.run("ovn-nbctl", "--if-exists", "pg-del", self.pg_name)
-            ctx.log(f"{self.pg_name} removed -- no slots left in it.")
+            # KEEP the empty port group and its ACLs.
+            #
+            # Deleting it left the segment half-built: ls-user-vm and
+            # lrp-user-vm still there, but nothing enforcing isolation on
+            # them. The next `--create` would rebuild it, but between the
+            # two the switch exists with no policy at all, and `ovnctl
+            # show` reports a segment with no ACLs -- which is
+            # indistinguishable from having forgotten to write them.
+            #
+            # An empty group costs nothing: its ACLs match `@pg_user_vms`,
+            # which resolves to no ports, so they compile to nothing.
+            ctx.run("ovn-nbctl", "--if-exists", "pg-set-ports", self.pg_name)
+            ctx.log(f"{self.pg_name} is now empty; its ACLs are kept so the "
+                    "segment stays complete.")
 
         self.alloc.drop(name)
         self.alloc.save()
@@ -494,11 +504,15 @@ class UserVM:
         ctx = self.ctx
         records = self.records()
         if not records:
-            # The normal state on a fresh deployment, and on every
-            # deployment where nobody has asked for a slot. Say what was
-            # checked rather than just "nothing to do" -- this runs as a
-            # deploy stage, and a silent stage that exists to protect
-            # something invisible is one people delete.
+            # No slots. If the segment was built at some point it must
+            # still be COMPLETE -- a switch with no port group is a switch
+            # with no isolation, and the next slot created on it would be
+            # unprotected for as long as it took someone to notice.
+            if ovn.nb_exists(ctx, "Logical_Switch", self.switch):
+                ctx.log(f"No slots allocated, but {self.switch} exists -- "
+                        "re-asserting the segment's ACLs.")
+                self.ensure_segment()
+                return 0
             ctx.log(f"No slots allocated in {self.alloc.path} -- nothing to "
                     "rebuild.")
             ctx.log("The segment is created on the first "

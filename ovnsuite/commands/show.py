@@ -711,6 +711,35 @@ def show_policies() -> None:
             total += 1
 
     print(f"\nTotal policies across all routers: {total}")
+    _show_address_sets()
+
+
+def _show_address_sets() -> None:
+    """Expand any $address_set referenced above.
+
+    A match reading `ip4.dst == $as_internal` is unreadable on its own --
+    the name says nothing about what is in it, and an operator has no way
+    to tell a populated set from a dangling reference. Both look identical
+    in the policy list, and one of them silently changes what the policy
+    does.
+    """
+    entries = rows(nb("name,addresses", "Address_Set"))
+    if not entries:
+        return
+    print("")
+    print("Address sets referenced above:")
+    for row in entries:
+        if len(row) < 2:
+            continue
+        name = str(row[0] or "")
+        addrs = extract_ovsdb_set(row[1])
+        if not addrs:
+            print(f"  ${name:<20} (EMPTY -- any match using it will never "
+                  "match)")
+            continue
+        print(f"  ${name:<20} {len(addrs)} entr{'y' if len(addrs) == 1 else 'ies'}")
+        for addr in sorted(addrs):
+            print(f"    {addr}")
 
 
 def _print_acl_rows(refs: list[str], acl_details: dict) -> int:
