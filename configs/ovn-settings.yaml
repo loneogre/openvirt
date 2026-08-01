@@ -155,6 +155,11 @@ localnet_external:
 # ----------------------------------------------------------------------------
 internal_ranges:
   ranges:
+    # The user-VM segment. Listed so the isolated VMs and the internal VMs
+    # cannot reach it either -- isolation there is written as "block the
+    # internal ranges", so a segment missing from this list is reachable
+    # from everything that uses it.
+    - "172.31.255.0/28"
     - "172.31.1.8/30"
     - "172.31.1.16/28"
     - "172.31.1.32/28"
@@ -401,7 +406,7 @@ vm_isolation:
 # allow rule for them would punch a hole in that.
 # ----------------------------------------------------------------------------
 acls:
-  enabled: true
+  enabled: false
 
   # Named port sets, referenced from a rule as tcp=@name / udp=@name.
   # FreeIPA client enrolment (ipa-client-install) needs all of these.
@@ -529,6 +534,52 @@ acl_log:
   # false = do not touch rsyslog or the vlog level; per-rule log=true is
   # still applied and records stay in ovn-controller's log.
   manage_sink: true
+
+# ----------------------------------------------------------------------------
+# [user_vms] -- ovnctl user-vm. Self-service slots for VMs we do not own.
+#
+# Ten pre-sized slots on their own segment behind lr-core. Allocated one
+# at a time; each allocation prints the virsh configuration to paste into
+# the guest's domain XML.
+#
+#   172.31.255.0/28   gateway 172.31.255.1   slots .2 - .11
+#
+# THE POLICY IS FIXED AND DELIBERATELY NARROW. Every slot may reach
+# defended terrain (nothing matches, the default route sends it to the
+# ASA) and nothing else. It may not reach our internal networks, and --
+# the part that is easy to get wrong -- it may not reach the OTHER SLOTS.
+# Slots share a subnet, so that traffic never passes the router and no
+# rule written about "internal networks" would ever see it; the drop set
+# therefore includes this subnet itself.
+#
+# The only per-VM choice is which management protocols may reach it,
+# selected at creation with --ssh / --rdp. That is the only knob that
+# cannot weaken anyone else's isolation.
+#
+# ALLOCATION IS RECORDED IN state/user-vms.json, not here. That file holds
+# each slot's UUID and MAC, which must survive `delete --purge-db` --
+# somebody else's libvirt domain references them by value. `ovnctl user-vm
+# --reapply` rebuilds OVN from it.
+#
+# management_source: who may open those sessions. One subnet, matching the
+# workstation LAN. Widening it widens it for every slot at once.
+# ----------------------------------------------------------------------------
+user_vms:
+  name_prefix: user-vm
+  slots: 10
+  subnet: 172.31.255.0/28
+  gateway: 172.31.255.1
+  first_ip: 172.31.255.2
+  switch: ls-user-vm
+  lrp: lrp-user-vm
+  lrp_mac: 00:00:00:00:01:04
+  pg_name: pg_user_vms
+  management_source: 172.31.0.0/27
+  # access_priority MUST exceed drop_priority -- the management rules are
+  # exceptions to the isolation drops. The command refuses to run if this
+  # is inverted, because the failure mode is ten silently unreachable VMs.
+  drop_priority: 1000
+  access_priority: 1100
 
 # ----------------------------------------------------------------------------
 # [vm_names] -- optional. Maps an inventory name from [vm_config] to the
@@ -693,11 +744,11 @@ pcap:
   # the capture file is created, so each pcap is born owned by this account
   # and its primary group; nothing chowns it afterwards. `--start` prints
   # the effective uid:gid so you can confirm what the files will look like.
-  drop_user: tcpdump
+  drop_user: ovnpcap
   min_free_mb: 2048         # warn below this
   # true  -> <directory>/<vm>/<file>
   # false -> everything flat in <directory>
-  subdirs: false
+  subdirs: true
   # Filenames are:
   #   <file_prefix>_<virsh-vm-name>_<capture-interface>_<YYYYMMDDHHMMSS>.pcap
   # e.g. internal_velociraptor-prod_mir-extvm3_20260730143022.pcap
@@ -728,4 +779,4 @@ diagnose:
   # in section 8 should get a reply from.
   gateway: 172.31.1.10
   lrp_int: lrp-int-vm
-  pg_expected_members: 4
+  pg_expected_members: 5

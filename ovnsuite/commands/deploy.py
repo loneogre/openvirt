@@ -47,6 +47,14 @@ STAGES = (
      "isolation port group and its scoped ACLs"),
     ("acl", ["acl"], REQUIRED,
      "micro-segmentation ACLs"),
+    # Rebuilds the user-VM segment and every allocated slot from
+    # state/user-vms.json. REQUIRED, not optional: `delete --purge-db`
+    # wipes the logical ports while the operator-owned libvirt domains
+    # keep pointing at their UUIDs, so a deploy that skipped this would
+    # leave those VMs silently disconnected with no error anywhere. It is
+    # a no-op when nothing is allocated.
+    ("user-vm", ["user-vm", "--reapply"], REQUIRED,
+     "user-VM segment and allocated slots"),
     # Host-side helpers. These depend on things outside OVN (libvirt,
     # tcpdump, running VMs) and are expected to no-op on some hosts.
     ("vm-attach", ["vm-attach"], OPTIONAL,
