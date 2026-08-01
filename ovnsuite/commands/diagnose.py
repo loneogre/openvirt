@@ -1049,6 +1049,8 @@ class Diagnose:
             if expected > 0:
                 if present > 0:
                     self.ok(f"Tier {prio} ({label}): present.")
+                    if prio == self.prio_split:
+                        self._check_split_negations()
                 else:
                     self.bad(f"Tier {prio} ({label}): configured in yaml but NO "
                              "policy exists.")
@@ -1061,6 +1063,35 @@ class Diagnose:
                               "earlier run.")
                 else:
                     self.skip(f"Tier {prio} ({label}): not configured, none present.")
+
+    def _check_split_negations(self) -> None:
+        """Count the negated destination terms in the split policy.
+
+        Each negated CIDR makes OVN compute the complement of that prefix,
+        and ANDing several together computes their CROSS PRODUCT. It is the
+        classic OVN flow-explosion shape, and it is invisible in the policy
+        list -- the rule reads perfectly sensibly. The only outward signs
+        are a br-int flow count in the hundreds of thousands and an
+        ovn-controller whose memory has nothing to do with the topology.
+        """
+        ctx = self.ctx
+        rows = ovn.nb_json(ctx, "priority,match", "Logical_Router_Policy")
+        negations = 0
+        for row in rows:
+            if len(row) < 2 or str(row[0]) != str(self.prio_split):
+                continue
+            negations = max(negations, str(row[1] or "").count("ip4.dst !="))
+        if negations <= 1:
+            return
+        self.bad(f"Tier {self.prio_split} uses {negations} separate "
+                 "'ip4.dst !=' terms.")
+        self.detail(
+            "Each negated CIDR expands to the complement of that prefix, and",
+            "ANDing them computes their cross product. Expect a very large",
+            "br-int flow count (section 6) and an ovn-controller using far",
+            "more memory than this topology can account for.",
+            "Fix: re-run `ovnctl localnet-external` -- it now builds this as",
+            "a single negation against an address set.")
 
     # ------------------------------------------------------------------
     # 6

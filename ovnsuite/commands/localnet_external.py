@@ -445,17 +445,52 @@ class LocalnetExternal:
                     "rule below).")
 
         # --- Tier 4 (base): the original exclusion rule ----------------
-        match = f"ip4.src == {self.split_subnet}"
-        for rng in self.internal_ranges:
-            match += f" && ip4.dst != {rng}"
+        #
+        # ONE negation against an address set, NOT one per range.
+        #
+        # This used to build "ip4.dst != A && ip4.dst != B && ..." with a
+        # term per internal range. Each negated CIDR makes OVN's expression
+        # engine compute the complement -- the set of prefixes covering the
+        # whole of IPv4 except that one -- and ANDing six of those together
+        # produces their CROSS PRODUCT. With five ranges this deployment
+        # compiled to 345,000 OpenFlow rules on br-int and drove
+        # ovn-controller to 14 GB resident while it expanded them; adding a
+        # sixth range made it worse.
+        #
+        # An address set is one complement instead of six, and northd
+        # handles it with a conjunctive match. Same semantics, and the
+        # flow count stops being a function of how many ranges are declared.
+        as_ref = self._internal_address_set()
+        match = f"ip4.src == {self.split_subnet} && ip4.dst != {as_ref}"
         ctx.log(f"  [{self.prio_split}] split (fall-through): src "
                 f"{self.split_subnet}, excluding {len(self.internal_ranges)} "
-                "internal range(s)")
+                f"internal range(s) via {as_ref}")
         self._policy_replace(self.prio_split,
                              f"ip4.src == {self.split_subnet} &&", match)
 
         ctx.log("Policy tiers applied. Verify with: "
                 f"ovn-nbctl lr-policy-list {self.lr_core}")
+
+    def _internal_address_set(self) -> str:
+        """Create or update the Address_Set holding [internal_ranges].
+
+        Returns the "$name" reference to use in a match. Kept in sync on
+        every run so a range added to the settings file cannot leave a
+        stale set behind quietly widening the ASA bypass.
+        """
+        ctx = self.ctx
+        name = ctx.config.cfg_opt("policy", "internal_address_set",
+                                  "as_internal")
+        addrs = ",".join(f'"{r}"' for r in self.internal_ranges)
+        uuid = ctx.qout("ovn-nbctl", "--bare", "--columns=_uuid", "find",
+                        "Address_Set", f"name={name}").strip()
+        if uuid:
+            ctx.run("ovn-nbctl", "set", "Address_Set", uuid,
+                    f"addresses=[{addrs}]")
+        else:
+            ctx.run("ovn-nbctl", "create", "Address_Set", f"name={name}",
+                    f"addresses=[{addrs}]")
+        return f"${name}"
 
     # ------------------------------------------------------------------
     def run_trace(self, src: str, dst: str) -> None:

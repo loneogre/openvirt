@@ -218,6 +218,28 @@ class Teardown:
             else:
                 ctx.warn(f"Failed to remove port group {group}.")
         self.report("Port groups:", f"{removed} removed (with their ACLs)")
+        self._address_sets()
+
+    def _address_sets(self) -> None:
+        """Address sets outlive the policies that referenced them.
+
+        Nothing else removes them, and a stale set with the old internal
+        ranges in it would be silently reused by the next deployment --
+        widening or narrowing the ASA bypass without anything in the
+        settings file saying so.
+        """
+        ctx = self.ctx
+        sets = ctx.q("ovn-nbctl", "--bare", "--columns=_uuid", "list",
+                     "Address_Set").lines
+        if not sets:
+            self.report("Address sets:", "none found")
+            return
+        removed = 0
+        for uuid in sets:
+            if ctx.run("ovn-nbctl", "--if-exists", "destroy", "Address_Set",
+                       uuid):
+                removed += 1
+        self.report("Address sets:", f"{removed} removed")
 
     # -- 6 ---------------------------------------------------------------
     def lb_and_meters(self) -> None:
