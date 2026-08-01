@@ -48,14 +48,22 @@ def register(subparsers) -> argparse.ArgumentParser:
                    metavar="SECONDS",
                    help=f"how long to wait for ports to bind "
                         f"(default: {DEFAULT_TIMEOUT})")
+    p.add_argument("--watch-memory", action="store_true",
+                   help="sample ovn-controller's resident memory each second "
+                        "while waiting, and print the curve")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
 
 
 class VMAttach:
-    def __init__(self, ctx: Ctx, timeout: int = DEFAULT_TIMEOUT):
+    def __init__(self, ctx: Ctx, timeout: int = DEFAULT_TIMEOUT,
+                 watch_memory: bool = False):
         self.ctx = ctx
+        # Sampling the curve is how you tell "allocates enormously on the
+        # first claim" from "leaks steadily while running" -- two different
+        # bugs that look identical once the number is already huge.
+        self.watch_memory = watch_memory
         self.br_int = ctx.cfg("topology", "br_int")
         self.timeout = timeout
         self.inv = Inventory(ctx.config)
@@ -153,7 +161,35 @@ class VMAttach:
         nudged = False
         deadline = time.time() + self.timeout
 
+        # Baseline, so the guard below measures GROWTH rather than an
+        # absolute that might be normal on a bigger deployment.
+        rss0 = ovn.controller_rss_mb(ctx)
+        if rss0:
+            ctx.log(f"  ovn-controller resident memory: {rss0} MB")
+
         while pending and time.time() < deadline:
+            # Stop hammering a controller that is running away with the
+            # host's memory. Claiming a port is what triggers it to build
+            # that datapath's pipeline, so continuing to poll -- and worse,
+            # re-asserting iface-id to force another claim -- drives the
+            # box towards OOM while we wait for something that is not
+            # going to happen.
+            rss = ovn.controller_rss_mb(ctx)
+            if rss > ovn.CONTROLLER_RSS_WARN_MB:
+                ctx.warn(f"ovn-controller has reached {rss} MB resident "
+                         f"(was {rss0} MB when this started).")
+                ctx.warn("Abandoning the wait rather than provoking further "
+                         "claims -- each one")
+                ctx.warn("makes it worse, and the host is what pays for it.")
+                for vm, tap in pending:
+                    ctx.warn(f"  {vm.name} left unbound (tap {tap})")
+                self.explain_unbound(*pending[0])
+                return
+
+            if self.watch_memory and rss:
+                elapsed = int(time.time() - (deadline - self.timeout))
+                ctx.log(f"    t+{elapsed:>3}s  {rss} MB")
+
             still: list[tuple[VM, str]] = []
             for vm, tap in pending:
                 if ovn.port_binding_chassis(ctx, vm.uuid):
@@ -170,7 +206,8 @@ class VMAttach:
             # db yet is the usual reason, and a purge makes it likely --
             # nothing will re-fire it on its own. Clearing and re-setting
             # the key produces the event again.
-            if not nudged and time.time() > deadline - self.timeout / 2:
+            if (not nudged and time.time() > deadline - self.timeout / 2
+                    and rss <= ovn.CONTROLLER_RSS_WARN_MB):
                 nudged = True
                 ctx.log("  Still unclaimed -- re-asserting iface-id to "
                         "re-trigger the claim.")
@@ -398,7 +435,8 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.require_cfg("topology:br_int")
     ctx.require_root()
 
-    cmd = VMAttach(ctx, timeout=getattr(args, "timeout", DEFAULT_TIMEOUT))
+    cmd = VMAttach(ctx, timeout=getattr(args, "timeout", DEFAULT_TIMEOUT),
+                   watch_memory=getattr(args, "watch_memory", False))
 
     if args.status:
         cmd.print_status()
