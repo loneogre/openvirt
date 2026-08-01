@@ -249,12 +249,56 @@ class VMAttach:
             ctx.warn("         ovnctl vm-attach")
             return
 
-        # 3. Everything the controller needs is present.
-        ctx.warn("    The port exists in the SB db and the tap is usable, so "
-                 "this is")
-        ctx.warn("    ovn-controller declining to claim it. Check:")
-        ctx.warn("      journalctl -u ovn-controller -e --no-pager | tail -30")
-        ctx.warn("      ovnctl diagnose")
+        # 3. Everything the controller needs is present, so interrogate the
+        #    controller instead of telling the operator to go and do it.
+        #    "Check the log" is not a diagnosis, and the state that answers
+        #    this is four commands nobody should have to remember under
+        #    time pressure.
+        ctx.warn("    Port exists in SB and the tap is usable. Controller "
+                 "state:")
+
+        alive = ctx.q("pgrep", "-x", "ovn-controller").ok
+        ctx.warn(f"      process running     : {'yes' if alive else 'NO'}")
+        if not alive:
+            ctx.warn("      -> ovn-controller is not running. Nothing will "
+                     "bind until it is.")
+            ctx.warn("         systemctl status ovn-controller")
+            return
+
+        conn = ctx.qout("ovn-appctl", "-t", "ovn-controller",
+                        "connection-status").strip()
+        ctx.warn(f"      SB connection       : {conn or 'unknown'}")
+
+        local_id = ovn.external_id(ctx, "system-id").strip()
+        registered = ovn.chassis_names(ctx)
+        ctx.warn(f"      local system-id     : {local_id or '<unset>'}")
+        ctx.warn(f"      registered chassis  : "
+                 f"{', '.join(registered) or '(none)'}")
+        if local_id and local_id not in registered:
+            ctx.warn("      -> the controller has not registered under its "
+                     "own system-id.")
+            ctx.warn("         It cannot claim anything. "
+                     "ovnctl reconcile --repair-identity")
+            return
+
+        # requested_chassis is the one field that makes a healthy
+        # controller refuse a port it can otherwise see: if it names a
+        # different chassis, this one is being told to keep its hands off.
+        row = ctx.qout("ovn-sbctl", "list", "Port_Binding", vm.uuid)
+        for line in row.splitlines():
+            key = line.split(":", 1)[0].strip()
+            if key in ("up", "requested_chassis", "additional_chassis",
+                       "requested_additional_chassis", "options", "type"):
+                ctx.warn(f"      {line.strip()}")
+
+        log = ctx.qout("journalctl", "-u", "ovn-controller", "-n", "15",
+                       "--no-pager", "-o", "cat")
+        if log.strip():
+            ctx.warn("    Last ovn-controller log lines:")
+            for line in log.splitlines()[-15:]:
+                ctx.warn(f"      {line}")
+        else:
+            ctx.warn("    (no ovn-controller journal output available)")
 
     # ------------------------------------------------------------------
     def print_status(self) -> None:
