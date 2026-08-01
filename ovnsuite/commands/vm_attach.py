@@ -21,11 +21,22 @@ import time
 
 from .. import libvirtutil, ovn
 from ..context import Abort, Ctx
-from ..inventory import Inventory
+from ..inventory import VM, Inventory
 from ..steps import StepRunner, add_step_args
 
 NAME = "vm-attach"
 HELP = "re-attach running VM taps to br-int"
+
+# How long to wait for ovn-controller to claim a freshly attached port.
+#
+# This used to be a flat 3-second sleep followed by an immediate status
+# print, which is why `ovnctl deploy` could report every VM as
+# "DOWN (no chassis)" on a deployment that was in fact fine thirty seconds
+# later. Claiming is not instant, and it is slowest in exactly the case
+# where this command matters most: right after `delete --purge-db`, when
+# ovn-controller is rebuilding its whole view and computing several
+# hundred thousand flows.
+DEFAULT_TIMEOUT = 60
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -33,15 +44,20 @@ def register(subparsers) -> argparse.ArgumentParser:
                               formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--status", action="store_true",
                    help="show what is attached vs not, and change nothing")
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT,
+                   metavar="SECONDS",
+                   help=f"how long to wait for ports to bind "
+                        f"(default: {DEFAULT_TIMEOUT})")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
 
 
 class VMAttach:
-    def __init__(self, ctx: Ctx):
+    def __init__(self, ctx: Ctx, timeout: int = DEFAULT_TIMEOUT):
         self.ctx = ctx
         self.br_int = ctx.cfg("topology", "br_int")
+        self.timeout = timeout
         self.inv = Inventory(ctx.config)
         if not self.inv.all:
             raise Abort("No [vm_config] inventory in ovn-settings.yaml -- "
@@ -50,6 +66,11 @@ class VMAttach:
         self.attached = 0
         self.skipped = 0
         self.unknown = 0
+        # Every VM that has a live tap this run, attached now or already
+        # attached. These are the ones that SHOULD end up bound, and the
+        # only ones worth waiting on -- a powered-off VM has no tap and
+        # will never bind, which is not a fault.
+        self.expect_bound: list[tuple[VM, str]] = []
 
     # ------------------------------------------------------------------
     def check_bridge(self) -> None:
@@ -78,6 +99,8 @@ class VMAttach:
                     self.unknown += 1
                     continue
 
+                self.expect_bound.append((vm, iface.tap))
+
                 if iface.tap in bridge_ports:
                     current = ovn.iface_id_of(ctx, iface.tap)
                     if current == vm.uuid:
@@ -100,21 +123,102 @@ class VMAttach:
         print("")
         ctx.log(f"Attached {self.attached}, already correct {self.skipped}, "
                 f"unmatched {self.unknown}.")
-        if self.attached > 0:
-            ctx.log("Waiting 3s for ovn-controller to claim the ports...")
-            time.sleep(3)
+
+    # ------------------------------------------------------------------
+    def wait_for_bindings(self) -> None:
+        """Wait until every tap that should be claimed actually is.
+
+        Polls the SB db rather than sleeping a fixed interval. The old
+        3-second sleep was a guess, and it was wrong in the one situation
+        this command exists for: straight after `delete --purge-db`,
+        ovn-controller is rebuilding from an empty SB db and has several
+        hundred thousand flows to compute, so a claim can take far longer
+        than three seconds. Deploy then printed "DOWN (no chassis)" for a
+        deployment that came good on its own a minute later, which is
+        indistinguishable from a real failure.
+        """
+        ctx = self.ctx
+        if ctx.dry_run or not self.expect_bound:
+            return
+
+        pending = list(self.expect_bound)
+        ctx.log(f"Waiting up to {self.timeout}s for ovn-controller to claim "
+                f"{len(pending)} port(s)...")
+        nudged = False
+        deadline = time.time() + self.timeout
+
+        while pending and time.time() < deadline:
+            still: list[tuple[VM, str]] = []
+            for vm, tap in pending:
+                if ovn.port_binding_chassis(ctx, vm.uuid):
+                    ctx.log(f"  {vm.name} bound.")
+                else:
+                    still.append((vm, tap))
+            pending = still
+            if not pending:
+                break
+
+            # One nudge, halfway through. ovn-controller claims a port in
+            # response to the iface-id appearing; if that event was missed
+            # -- the SB Port_Binding row not having propagated from the NB
+            # db yet is the usual reason, and a purge makes it likely --
+            # nothing will re-fire it on its own. Clearing and re-setting
+            # the key produces the event again.
+            if not nudged and time.time() > deadline - self.timeout / 2:
+                nudged = True
+                ctx.log("  Still unclaimed -- re-asserting iface-id to "
+                        "re-trigger the claim.")
+                for vm, tap in pending:
+                    ctx.run("ovs-vsctl", "remove", "interface", tap,
+                            "external-ids", "iface-id")
+                    ctx.run("ovs-vsctl", "set", "interface", tap,
+                            f"external-ids:iface-id={vm.uuid}")
+            time.sleep(2)
+
+        if not pending:
+            ctx.log("All expected ports are bound.")
+            return
+
+        ctx.warn(f"{len(pending)} port(s) still unbound after {self.timeout}s:")
+        for vm, tap in pending:
+            ctx.warn(f"  {vm.name} ({vm.uuid}) tap {tap}")
+        ctx.warn("The VMs are running and their taps are on the bridge, so "
+                 "this is")
+        ctx.warn("ovn-controller not claiming them. Check:")
+        ctx.warn("  journalctl -u ovn-controller -e --no-pager | tail -30")
+        ctx.warn("  ovnctl diagnose")
 
     # ------------------------------------------------------------------
     def print_status(self) -> None:
+        """The resulting table.
+
+        A VM with no tap is powered off and was never going to bind, so it
+        gets its own state rather than the same "DOWN (no chassis)" as a
+        running VM whose port failed to be claimed. Printing ten identical
+        alarming rows, nine of which are normal, trains people to ignore
+        the one that matters.
+        """
         ctx = self.ctx
+        chassis_names = ovn.chassis_uuid_names(ctx)
         print("")
         print("=== Port binding status ===")
         print(f"{'VM':<10} {'PORT (iface-id)':<38} {'TAP':<10} CHASSIS")
+        problems = 0
         for vm in self.inv.all:
             tap = ovn.iface_for_iface_id(ctx, vm.uuid)
             chassis = ovn.port_binding_chassis(ctx, vm.uuid)
-            print(f"{vm.name:<10} {vm.uuid:<38} {tap or '-':<10} "
-                  f"{chassis or 'DOWN (no chassis)'}")
+            if chassis:
+                state = f"bound @{chassis_names.get(chassis, chassis[:12])}"
+            elif not tap:
+                state = "no tap -- VM not running"
+            else:
+                state = "UNBOUND -- tap present, not claimed"
+                problems += 1
+            print(f"{vm.name:<10} {vm.uuid:<38} {tap or '-':<10} {state}")
+        if problems:
+            print("")
+            print(f"{problems} running VM(s) are not bound. Re-run "
+                  "`ovnctl vm-attach`, then `ovnctl diagnose`.")
 
 
 def main(ctx: Ctx, args: argparse.Namespace) -> int:
@@ -122,7 +226,7 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.require_cfg("topology:br_int")
     ctx.require_root()
 
-    cmd = VMAttach(ctx)
+    cmd = VMAttach(ctx, timeout=getattr(args, "timeout", DEFAULT_TIMEOUT))
 
     if args.status:
         cmd.print_status()
@@ -139,6 +243,8 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     runner = StepRunner(ctx, "vm-attach")
     runner.add("check-bridge", "verify br-int exists", cmd.check_bridge)
     runner.add("attach", "re-attach every running VM's tap", cmd.attach)
+    runner.add("wait", "wait for ovn-controller to claim the ports",
+               cmd.wait_for_bindings)
     runner.add("status", "print the resulting port binding table",
                cmd.print_status)
 
