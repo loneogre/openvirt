@@ -210,6 +210,38 @@ class Diagnose:
     # ------------------------------------------------------------------
     # 1
     # ------------------------------------------------------------------
+    def _controller_memory(self) -> None:
+        """Flag a controller whose memory use is not explicable.
+
+        Reported in the very first section because it invalidates the
+        reading of nearly every later one: an ovn-controller in this state
+        produces unbound ports, unanswered appctl queries and slow claims,
+        all of which then look like separate faults.
+        """
+        rss = ovn.controller_rss_mb(self.ctx)
+        if not rss:
+            return
+        if rss <= ovn.CONTROLLER_RSS_WARN_MB:
+            self.detail(f"resident memory: {rss} MB")
+            return
+        self.bad(f"ovn-controller is using {rss} MB of memory.")
+        self.detail(
+            "Tens of MB is normal for a single chassis of this size. At this",
+            "level the daemon stops answering its control socket, claims",
+            "ports slowly or not at all, and cannot be stopped cleanly.",
+            "Later findings about unbound ports are most likely consequences",
+            "of this rather than independent faults.")
+        sizes = ovn.sb_table_sizes(self.ctx)
+        self.detail("Southbound row counts: " + ", ".join(
+            f"{k}={v}" for k, v in sizes.items()))
+        if sizes.get("MAC_Binding", 0) > 1000:
+            self.detail("MAC_Binding is large. It grows from observed traffic,",
+                        "not from configuration -- the usual cause of memory",
+                        "that does not match the topology.")
+        else:
+            self.detail("Nothing here explains it, which points at the daemon:",
+                        "  ovn-controller --version")
+
     def check_controller_service(self) -> None:
         ctx = self.ctx
         self.section("1. ovn-controller service")
@@ -218,6 +250,7 @@ class Diagnose:
             return
         if ctx.unit_active("ovn-controller"):
             self.ok("ovn-controller service is active.")
+            self._controller_memory()
             return
         if self.not_deployed(SETUP):
             self.skip("ovn-controller not active -- expected, tracker shows "

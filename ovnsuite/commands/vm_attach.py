@@ -259,6 +259,35 @@ class VMAttach:
 
         alive = ctx.q("pgrep", "-x", "ovn-controller").ok
         ctx.warn(f"      process running     : {'yes' if alive else 'NO'}")
+
+        # Checked BEFORE the connection status, because it changes what an
+        # unresponsive socket means. "Busy" is a state a controller comes
+        # out of; a multi-gigabyte resident set is one it does not, and
+        # from the outside the two are identical.
+        rss = ovn.controller_rss_mb(ctx)
+        if rss:
+            flag = "  <-- ABNORMAL" if rss > ovn.CONTROLLER_RSS_WARN_MB else ""
+            ctx.warn(f"      resident memory     : {rss} MB{flag}")
+        if rss > ovn.CONTROLLER_RSS_WARN_MB:
+            ctx.warn("      -> ovn-controller is using far more memory than "
+                     "this topology")
+            ctx.warn("         can account for. A few tens of MB is normal "
+                     "for one chassis")
+            ctx.warn("         and ~600 flows. At this size it stops "
+                     "servicing its control")
+            ctx.warn("         socket, claims ports slowly or not at all, "
+                     "and cannot be")
+            ctx.warn("         stopped cleanly -- every symptom in this "
+                     "report follows from it.")
+            ctx.warn("         This is the daemon, not the deployment. "
+                     "Investigate:")
+            ctx.warn("           ovn-sbctl --columns=_uuid list MAC_Binding "
+                     "| wc -l")
+            ctx.warn("           ovn-sbctl list Logical_Flow | wc -l")
+            ctx.warn("           ovn-controller --version")
+            ctx.warn("         A restart reclaims the memory but does not "
+                     "address the cause.")
+
         if not alive:
             ctx.warn("      -> ovn-controller is not running. Nothing will "
                      "bind until it is.")

@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 
+from pathlib import Path
+
 from .context import Ctx
 
 
@@ -534,6 +536,53 @@ def appctl(ctx: Ctx, *args: object, timeout: float = 10):
     """
     target = controller_ctl(ctx) or "ovn-controller"
     return ctx.q("ovn-appctl", "-t", target, *args, timeout=timeout)
+
+
+#: Resident set above which ovn-controller is not merely busy but sick.
+#: A single-chassis deployment of this size should sit in the tens of MB;
+#: hundreds are unusual, gigabytes mean something is wrong inside the
+#: daemon and no amount of waiting will fix it.
+CONTROLLER_RSS_WARN_MB = 1024
+
+
+def controller_rss_mb(ctx: Ctx) -> int:
+    """ovn-controller's resident memory in MB (0 if it cannot be read).
+
+    Worth checking before concluding "the controller is busy". Busy is a
+    state it comes out of; 14 GB of RSS is a state it does not, and the
+    two look identical from the outside -- slow claims, an unresponsive
+    control socket, a stop that times out and gets SIGKILLed.
+    """
+    pid = ctx.qout("pgrep", "-x", "ovn-controller", timeout=5).split()
+    if not pid:
+        return 0
+    try:
+        status = Path(f"/proc/{pid[0]}/status").read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    for line in status.splitlines():
+        if line.startswith("VmRSS:"):
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                return int(parts[1]) // 1024
+    return 0
+
+
+def sb_table_sizes(ctx: Ctx) -> dict[str, int]:
+    """Row counts for the SB tables that explain controller memory.
+
+    MAC_Binding first: it grows from observed traffic rather than from
+    configuration, so it is the one table that can be enormous on a
+    deployment whose config is tiny -- exactly the shape to look for when
+    the daemon's memory does not match the topology.
+    """
+    sizes: dict[str, int] = {}
+    for table in ("MAC_Binding", "Logical_Flow", "Port_Binding",
+                  "Datapath_Binding"):
+        out = ctx.qout("ovn-sbctl", "--bare", "--columns=_uuid", "list",
+                       table, timeout=20)
+        sizes[table] = len([ln for ln in out.splitlines() if ln.strip()])
+    return sizes
 
 
 def controller_log_tail(ctx: Ctx, match: str = "", lines: int = 20) -> str:
