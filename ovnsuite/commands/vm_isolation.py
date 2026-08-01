@@ -382,6 +382,7 @@ class VMIsolation:
         unblocked: list[str] = []
         unknown: list[str] = []
         last_expr = last_out = ""
+        fail_expr = fail_out = ""
         for m_name, m_uuid, m_ip in self.isolated:
             member = self.inv.by_uuid(m_uuid)
             if member is None:
@@ -399,6 +400,8 @@ class VMIsolation:
                 last_expr, last_out = expr, out
             else:
                 unblocked.append(f"{m_name} ({target})")
+                if not fail_expr:
+                    fail_expr, fail_out = expr, out
 
         if blocked:
             ctx.log(f"  OK: {len(blocked)} member(s) correctly blocked from "
@@ -429,7 +432,48 @@ class VMIsolation:
                  "be effective:")
         for entry in unblocked:
             ctx.warn(f"  {entry}")
-        ctx.warn(f"Check: ovn-nbctl acl-list {self.pg_name}")
+        self._explain_unblocked(fail_expr, fail_out)
+
+    def _explain_unblocked(self, expr: str, out: str) -> None:
+        """Show the evidence rather than just the conclusion.
+
+        A bare "not blocked" sends you to read acl-list and compare match
+        strings by eye. The three things needed to tell an ACL problem from
+        a probe problem are the trace itself, what OVN actually has
+        deployed, and whether northd has compiled it -- so print all three
+        here instead of making them the next round-trip.
+        """
+        ctx = self.ctx
+        if expr:
+            ctx.warn("Trace for the first unblocked member "
+                     "(ALLOW means the drop ACL was never reached):")
+            tail = out.splitlines()[-25:]
+            ctx.note_stderr("\n".join(tail) if tail else "(no output)")
+            ctx.warn("Reproduce with:")
+            ctx.warn(f"  ovn-trace {self.ls_ext} '{expr}'")
+
+        acls = ctx.qout("ovn-nbctl", "acl-list", self.pg_name)
+        ctx.warn(f"Deployed ACLs on {self.pg_name}:")
+        ctx.note_stderr(acls or "(none -- the ACLs were not created)")
+
+        members = ovn.pg_members(ctx, self.pg_name)
+        ctx.warn(f"Port group members ({len(members)}): "
+                 f"{', '.join(members) or '(none)'}")
+
+        # If northd has not compiled the ACLs into logical flows, the trace
+        # is describing a pipeline that does not contain them yet -- which
+        # looks exactly like a missing ACL.
+        flows = ctx.qout("ovn-sbctl", "--bare", "--columns=_uuid", "find",
+                         "Logical_Flow", f"match~=\"{self.pg_name}\"")
+        n_flows = len([f for f in flows.splitlines() if f.strip()])
+        if n_flows:
+            ctx.warn(f"Southbound logical flows referencing {self.pg_name}: "
+                     f"{n_flows} (northd has compiled them).")
+        else:
+            ctx.warn(f"NO Southbound logical flow references {self.pg_name}.")
+            ctx.warn("northd has not compiled these ACLs, so nothing can "
+                     "enforce them yet.")
+            ctx.warn("Check: systemctl status ovn-northd")
 
     # ------------------------------------------------------------------
     def run_trace(self, src: str, dst: str) -> None:
