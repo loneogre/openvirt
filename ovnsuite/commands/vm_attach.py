@@ -265,9 +265,13 @@ class VMAttach:
             ctx.warn("         systemctl status ovn-controller")
             return
 
-        conn = ctx.qout("ovn-appctl", "--timeout=5", "-t", "ovn-controller",
-                        "connection-status", timeout=10).strip()
-        ctx.warn(f"      SB connection       : {conn or 'unknown'}")
+        res = ovn.appctl(ctx, "connection-status")
+        conn = res.stdout.strip()
+        ctx.warn(f"      control socket      : "
+                 f"{ovn.controller_ctl(ctx) or 'NOT FOUND'}")
+        ctx.warn(f"      SB connection       : {conn or 'no answer'}")
+        if not conn and res.stderr:
+            ctx.warn(f"      appctl said         : {res.stderr.splitlines()[0]}")
         if not conn:
             # An empty answer usually means the controller is too busy to
             # service its control socket -- which on this deployment means
@@ -301,14 +305,22 @@ class VMAttach:
                        "requested_additional_chassis", "options", "type"):
                 ctx.warn(f"      {line.strip()}")
 
-        log = ctx.qout("journalctl", "-u", "ovn-controller", "-n", "15",
-                       "--no-pager", "-o", "cat")
+        # ovn-controller's OWN log, not systemd's view of the unit. The
+        # journal only ever showed "stopping / starting", which is the one
+        # thing we already knew; the daemon writes "Claiming lport ..." (or
+        # its reason for not) to its log file.
+        log = ovn.controller_log_tail(ctx, match=vm.uuid[:8])
         if log.strip():
-            ctx.warn("    Last ovn-controller log lines:")
-            for line in log.splitlines()[-15:]:
+            ctx.warn("    ovn-controller log (binding/errors):")
+            for line in log.splitlines():
                 ctx.warn(f"      {line}")
         else:
-            ctx.warn("    (no ovn-controller journal output available)")
+            ctx.warn("    ovn-controller's log file was not readable. Try:")
+            for path in ovn.CONTROLLER_LOGS:
+                ctx.warn(f"      tail -50 {path}")
+            ctx.warn("    (journalctl -u ovn-controller shows only systemd's "
+                     "view of the unit,")
+            ctx.warn("     not what the daemon itself is saying.)")
 
     # ------------------------------------------------------------------
     def print_status(self) -> None:

@@ -495,6 +495,61 @@ def sb_records(ctx: Ctx, columns: str, table: str,
 
 
 # ---------------------------------------------------------------------------
+# ovn-controller's control socket
+# ---------------------------------------------------------------------------
+#: ovn-controller's log, when it is not going to the journal. ovn-ctl
+#: starts it with --log-file, so the daemon's OWN messages (claiming a
+#: port, refusing to, connection state) land here -- `journalctl -u
+#: ovn-controller` shows only systemd's view of the unit, which is why
+#: reading the journal told us nothing but "stopping / starting".
+CONTROLLER_LOGS = (
+    "/var/log/ovn/ovn-controller.log",
+    "/var/log/openvswitch/ovn-controller.log",
+)
+
+#: `ovn-appctl -t ovn-controller` resolves the socket in OVN_RUNDIR, which
+#: is not always where the socket is -- this host has
+#: rundir=/var/run/openvswitch while ovn-controller's pidfile lives under
+#: /run/ovn. When the name does not resolve, appctl fails and every caller
+#: gets an empty answer that looks like "the controller is not talking".
+CTL_DIRS = ("/run/ovn", "/var/run/ovn", "/run/openvswitch",
+            "/var/run/openvswitch")
+
+
+def controller_ctl(ctx: Ctx) -> str:
+    """Full path to ovn-controller's control socket ('' if not found)."""
+    import glob
+    for base in CTL_DIRS:
+        found = sorted(glob.glob(f"{base}/ovn-controller.*.ctl"))
+        if found:
+            return found[-1]
+    return ""
+
+
+def appctl(ctx: Ctx, *args: object, timeout: float = 10):
+    """ovn-appctl against ovn-controller, by socket PATH not by name.
+
+    Returns the Result so callers can show stderr -- "unknown" is a
+    useless thing to print when the command had something to say.
+    """
+    target = controller_ctl(ctx) or "ovn-controller"
+    return ctx.q("ovn-appctl", "-t", target, *args, timeout=timeout)
+
+
+def controller_log_tail(ctx: Ctx, match: str = "", lines: int = 20) -> str:
+    """The tail of ovn-controller's own log, optionally filtered."""
+    for path in CONTROLLER_LOGS:
+        out = ctx.qout("tail", "-n", "400", path, timeout=10)
+        if not out.strip():
+            continue
+        rows = [ln for ln in out.splitlines()
+                if not match or match in ln or "|binding|" in ln
+                or "|ofctrl|" in ln or "ERR" in ln or "WARN" in ln]
+        return "\n".join((rows or out.splitlines())[-lines:])
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # northd synchronisation
 # ---------------------------------------------------------------------------
 def sync_sb(ctx: Ctx, timeout: int = 30) -> bool:

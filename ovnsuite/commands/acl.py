@@ -256,9 +256,8 @@ class ACLManager:
             # subprocess timeout catches the case where it ignores it.
             # Without this the step hangs forever whenever ovn-controller
             # is rebuilding, which is precisely when a deploy is running.
-            res = ctx.run("ovn-appctl", "--timeout=5", "-t", "ovn-controller",
-                          "vlog/set", f"acl_log:syslog:{self.log_severity}",
-                          timeout=10)
+            res = ovn.appctl(ctx, "vlog/set",
+                             f"acl_log:syslog:{self.log_severity}")
             if res.returncode == 124:
                 ctx.warn("ovn-controller did not answer within 10s -- it is "
                          "busy, not broken.")
@@ -268,8 +267,13 @@ class ACLManager:
                          "syslog yet. Re-run:")
                 ctx.warn("  ovnctl acl --only log-sink")
             elif not res:
-                ctx.warn("Could not set the acl_log vlog level -- is "
-                         "ovn-controller running?")
+                ctx.warn("Could not set the acl_log vlog level.")
+                ctx.warn(f"  socket: {ovn.controller_ctl(ctx) or 'NOT FOUND'}")
+                if res.stderr:
+                    ctx.warn(f"  ovn-appctl: {res.stderr.splitlines()[0]}")
+                ctx.warn("  ACL logging is enabled on the rules regardless; "
+                         "only the vlog level")
+                ctx.warn("  is unset, so records may not reach syslog.")
         else:
             ctx.warn("ovn-appctl not found -- cannot raise the acl_log vlog "
                      "level, so records may never reach syslog.")
