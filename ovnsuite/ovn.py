@@ -1,353 +1,543 @@
 """
-Shared behaviour for every subcommand -- the port of ovn-common.sh and
-ovn-dryrun.sh.
+Thin helpers around ovn-nbctl / ovn-sbctl / ovs-vsctl.
 
-OUTPUT CONTRACT (unchanged from the shell suite)
-  success  : one summary line, nothing else
-  -v       : the full step-by-step narration
-  --dry-run: the commands that would run, and nothing else
-  warnings : always, on stderr
-  errors   : always, on stderr, then exit non-zero
+Almost all of these are READ-ONLY queries. Mutating commands stay as
+explicit ``ctx.run("ovn-nbctl", ...)`` calls in the command modules so they
+remain visible in the --dry-run listing exactly as the shell version
+printed them.
 
-Nothing here is optional or best-effort. If the settings file is missing
-the run stops with a clear message rather than silently falling back to
-built-in defaults and producing a deployment that does not match the
-configuration.
+The one exception is ``add_acl`` below: it has a version-compatibility
+fallback that two separate command modules would otherwise each have to
+carry a copy of. It still goes through ctx.run, so it prints under
+--dry-run like everything else.
 """
 
 from __future__ import annotations
 
-import os
-import re
-import shutil
-import subprocess
-import sys
-from dataclasses import dataclass, field
-from pathlib import Path
+import json
+from dataclasses import dataclass
 
-from . import paths
-from .config import Config, ConfigError
-
-# Characters that never need quoting in the dry-run listing.
-_SAFE_RE = re.compile(r"^[A-Za-z0-9_./:=@%+,-]+$")
+from .context import Ctx
 
 
-def shquote(arg: str) -> str:
-    """Port of _dr_quote: shell-safe, but readable for the common case."""
-    if arg == "":
-        return "''"
-    if _SAFE_RE.match(arg):
-        return arg
-    return "'" + arg.replace("'", "'\\''") + "'"
+# ---------------------------------------------------------------------------
+# ovs-vsctl
+# ---------------------------------------------------------------------------
+def br_exists(ctx: Ctx, bridge: str) -> bool:
+    return ctx.q("ovs-vsctl", "br-exists", bridge).ok
 
 
-def format_cmd(argv: list[str]) -> str:
-    return " ".join(shquote(str(a)) for a in argv)
+def list_br(ctx: Ctx) -> list[str]:
+    return ctx.q("ovs-vsctl", "list-br").lines
 
 
-class Colour:
-    """ANSI codes, but only when stdout is a terminal and NO_COLOR is unset.
+def list_ports(ctx: Ctx, bridge: str) -> list[str]:
+    return ctx.q("ovs-vsctl", "list-ports", bridge).lines
 
-    `ovnctl --no-color` exports NO_COLOR before the subcommand runs, so
-    honouring the variable covers the flag too, and a redirected run
-    (`ovnctl acl --audit > report.txt`) stays plain text without anyone
-    having to remember the flag.
+
+def iface_type(ctx: Ctx, iface: str) -> str:
+    return ctx.qout("ovs-vsctl", "get", "interface", iface, "type").strip('"')
+
+
+def external_id(ctx: Ctx, key: str) -> str:
+    """A single key out of Open_vSwitch external-ids ('' if unset)."""
+    res = ctx.q("ovs-vsctl", "get", "open", ".", f"external-ids:{key}")
+    return res.stdout.strip('"') if res.ok else ""
+
+
+def has_external_id(ctx: Ctx, key: str) -> bool:
+    return ctx.q("ovs-vsctl", "get", "open", ".", f"external-ids:{key}").ok
+
+
+def iface_for_iface_id(ctx: Ctx, iface_id: str) -> str:
+    """The local OVS interface carrying this OVN logical port, if any."""
+    out = ctx.qout("ovs-vsctl", "--bare", "--columns=name", "find", "Interface",
+                   f"external-ids:iface-id={iface_id}")
+    return out.splitlines()[0].strip() if out.strip() else ""
+
+
+def iface_id_map(ctx: Ctx) -> dict[str, str]:
+    """Every local OVS interface carrying an iface-id: iface-id -> name.
+
+    One query for the whole table. iface_for_iface_id() is the same lookup
+    for a single id; use this one when more than a couple are wanted.
     """
+    rows = _json_rows(
+        ctx.qout("ovs-vsctl", "--format=json", "--columns=name,external_ids",
+                 "list", "Interface"), "name,external_ids")
+    found: dict[str, str] = {}
+    for row in rows:
+        if len(row) < 2:
+            continue
+        for key, value in _json_map(row[1]):
+            if key == "iface-id" and value:
+                found.setdefault(value, str(row[0]))
+    return found
 
-    def __init__(self) -> None:
-        enabled = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
-        self.red = "\033[31m" if enabled else ""
-        self.grn = "\033[32m" if enabled else ""
-        self.ylw = "\033[33m" if enabled else ""
-        self.dim = "\033[2m" if enabled else ""
-        self.bold = "\033[1m" if enabled else ""
-        self.rst = "\033[0m" if enabled else ""
+
+def iface_id_of(ctx: Ctx, iface: str) -> str:
+    res = ctx.q("ovs-vsctl", "get", "interface", iface, "external-ids:iface-id")
+    return res.stdout.strip('"') if res.ok else ""
 
 
-class Abort(Exception):
-    """Fatal error -- message already formatted, exit non-zero."""
+def mirror_exists(ctx: Ctx, name: str) -> bool:
+    out = ctx.qout("ovs-vsctl", "--bare", "--columns=_uuid", "find", "Mirror",
+                   f"name={name}")
+    return bool(out.strip())
 
-    def __init__(self, message: str, code: int = 1):
-        super().__init__(message)
-        self.message = message
-        self.code = code
+
+# ---------------------------------------------------------------------------
+# ovn-nbctl
+# ---------------------------------------------------------------------------
+def nb_exists(ctx: Ctx, table: str, name: str) -> bool:
+    return ctx.q("ovn-nbctl", "list", table, name).ok
+
+
+def lr_exists(ctx: Ctx, router: str) -> bool:
+    return nb_exists(ctx, "Logical_Router", router)
+
+
+def ls_exists(ctx: Ctx, switch: str) -> bool:
+    return nb_exists(ctx, "Logical_Switch", switch)
+
+
+def lsp_exists(ctx: Ctx, port: str) -> bool:
+    return nb_exists(ctx, "Logical_Switch_Port", port)
+
+
+def lrp_list(ctx: Ctx, router: str) -> str:
+    return ctx.qout("ovn-nbctl", "lrp-list", router)
+
+
+def lrp_present(ctx: Ctx, router: str, port: str) -> bool:
+    return port in lrp_list(ctx, router)
+
+
+def lsp_list(ctx: Ctx, switch: str) -> str:
+    return ctx.qout("ovn-nbctl", "lsp-list", switch)
+
+
+def pg_uuid(ctx: Ctx, name: str) -> str:
+    return ctx.qout("ovn-nbctl", "--bare", "--columns=_uuid", "find",
+                    "Port_Group", f"name={name}").strip()
+
+
+def pg_exists(ctx: Ctx, name: str) -> bool:
+    return bool(pg_uuid(ctx, name))
+
+
+def pg_members(ctx: Ctx, name: str) -> list[str]:
+    out = ctx.qout("ovn-nbctl", "--bare", "--columns=ports", "list",
+                   "Port_Group", name)
+    return out.split()
+
+
+@dataclass(frozen=True)
+class Acl:
+    """One row of the ACL table."""
+
+    direction: str
+    priority: str
+    action: str
+    match: str
 
 
 @dataclass
-class Result:
-    """Outcome of a command invocation."""
+class PortGroup:
+    """A Port_Group row with its references already resolved."""
 
-    returncode: int
-    stdout: str = ""
-    stderr: str = ""
-
-    @property
-    def ok(self) -> bool:
-        return self.returncode == 0
-
-    def __bool__(self) -> bool:  # so `if ctx.run(...)` reads naturally
-        return self.ok
-
-    @property
-    def lines(self) -> list[str]:
-        return [ln for ln in self.stdout.splitlines() if ln.strip()]
+    name: str
+    ports: list[str]          # logical switch port NAMES, not row uuids
+    acls: list[Acl]
 
 
-@dataclass
-class Ctx:
-    """Per-run state: flags, counters, and the configuration."""
-
-    prefix: str = "ovn"
-    verbose: bool = False
-    dry_run: bool = False
-    # True for --list-steps. The listing is documentation, so it must work
-    # on a laptop with no OVN installed and no root -- the preconditions
-    # below are skipped rather than turning "what does this do?" into an
-    # error about a missing binary.
-    listing: bool = False
-    changes: int = 0
-    warnings: int = 0
-    # Ceiling for read-only queries. ovn-nbctl and ovn-sbctl wait on the db
-    # forever by default, and the commands that query them are the ones run
-    # while that db is unreachable.
-    query_timeout: float = 15.0
-    _config: Config | None = field(default=None, repr=False)
-
-    # ------------------------------------------------------------------
-    # configuration
-    # ------------------------------------------------------------------
-    @property
-    def cfg_file(self) -> Path:
-        return self._config.path if self._config else paths.settings_file()
-
-    def load_config(self, prefix: str | None = None) -> Config:
-        """Port of ovn_common_init: set the log prefix and load the yaml."""
-        if prefix:
-            self.prefix = prefix
-        if self._config is None:
-            self._config = Config().load()
-        return self._config
-
-    @property
-    def config(self) -> Config:
-        if self._config is None:
-            self._config = Config().load()
-        return self._config
-
-    # Thin pass-throughs so command modules read like the shell did.
-    def cfg(self, section: str, key: str) -> str:
-        return self.config.cfg(section, key)
-
-    def cfg_opt(self, section: str, key: str, default: str = "") -> str:
-        return self.config.cfg_opt(section, key, default)
-
-    def cfg_int(self, section: str, key: str) -> int:
-        return self.config.cfg_int(section, key)
-
-    def cfg_bool(self, section: str, key: str, default: bool = False) -> bool:
-        return self.config.cfg_bool(section, key, default)
-
-    def cfg_array(self, section: str, key: str) -> list[str] | None:
-        return self.config.cfg_array(section, key)
-
-    def cfg_list(self, section: str, key: str) -> list[str]:
-        return self.config.cfg_list(section, key)
-
-    def require_cfg(self, *pairs: str) -> None:
-        self.config.require(*pairs)
-
-    # ------------------------------------------------------------------
-    # output
-    # ------------------------------------------------------------------
-    def log(self, *parts: object) -> None:
-        """Step narration. Shown only with -v, never in a dry-run listing."""
-        if self.verbose and not self.dry_run:
-            print(f"[{self.prefix}] {' '.join(str(p) for p in parts)}")
-
-    def say(self, *parts: object) -> None:
-        """Something the operator must see even on a quiet successful run."""
-        if not self.dry_run:
-            print(f"[{self.prefix}] {' '.join(str(p) for p in parts)}")
-
-    def out(self, *parts: object) -> None:
-        """Plain output (tables, summaries) -- suppressed under --dry-run."""
-        if not self.dry_run:
-            print(" ".join(str(p) for p in parts) if parts else "")
-
-    def warn(self, *parts: object) -> None:
-        self.warnings += 1
-        print(f"[{self.prefix}] WARNING: {' '.join(str(p) for p in parts)}",
-              file=sys.stderr)
-
-    def err(self, *parts: object) -> None:
-        print(f"[{self.prefix}] ERROR: {' '.join(str(p) for p in parts)}",
-              file=sys.stderr)
-
-    def note_stderr(self, text: str, indent: str = "        ") -> None:
-        for line in str(text).splitlines():
-            print(f"{indent}{line}", file=sys.stderr)
-
-    def die(self, *parts: object) -> "Abort":
-        """Raise, don't exit -- the CLI turns this into the exit status."""
-        raise Abort(" ".join(str(p) for p in parts))
-
-    def finish(self, *parts: object) -> None:
-        """The single success line. Call at the end of a successful run."""
-        if self.dry_run:
-            return
-        extra = f" ({self.changes} commands)" if self.changes > 0 else ""
-        msg = " ".join(str(p) for p in parts)
-        if self.warnings > 0:
-            print(f"[{self.prefix}] OK: {msg} -- {self.warnings} warning(s){extra}")
-        else:
-            print(f"[{self.prefix}] OK: {msg}{extra}")
-
-    def dr_head(self, *parts: object) -> None:
-        """Section heading, dry-run listings only."""
-        if self.dry_run:
-            print(f"\n# {' '.join(str(p) for p in parts)}")
-
-    def dr_banner(self, *parts: object) -> None:
-        if self.dry_run:
-            print(f"# {' '.join(str(p) for p in parts)}")
-            print("# Commands reflect the current state -- "
-                  "already-configured items are omitted.")
-
-    # ------------------------------------------------------------------
-    # command execution
-    # ------------------------------------------------------------------
-    def run(self, *argv: object, check: bool = False,
-            stdin: str | None = None) -> Result:
-        """A MUTATING command: printed under --dry-run, executed otherwise."""
-        cmd = [str(a) for a in argv]
-        if self.dry_run:
-            print(format_cmd(cmd))
-            return Result(0)
-        self.changes += 1
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, text=True, input=stdin, check=False
-            )
-        except FileNotFoundError:
-            res = Result(127, "", f"{cmd[0]}: command not found")
-            if check:
-                raise Abort(f"{cmd[0]}: command not found") from None
-            return res
-        res = Result(proc.returncode, (proc.stdout or "").strip(),
-                     (proc.stderr or "").strip())
-        if check and not res.ok:
-            raise Abort(
-                f"command failed ({res.returncode}): {format_cmd(cmd)}\n"
-                f"{res.stderr}"
-            )
-        return res
-
-    def q(self, *argv: object, timeout: float | None = None) -> Result:
-        """A read-only QUERY.
-
-        Never wrapped by dry-run: the printed command list has to reflect
-        what would actually change given the current state of the system,
-        which means the queries that decide that must really run.
-
-        Always bounded. A hung query is worse than a failed one: `diagnose`
-        runs twenty-odd checks and a single blocking ovn-sbctl call means
-        none of the remaining ones ever report. Timing out yields a normal
-        failed Result (rc 124, as timeout(1) uses), so every existing
-        `if not res.ok` path already handles it.
-        """
-        cmd = [str(a) for a in argv]
-        limit = self.query_timeout if timeout is None else timeout
-        try:
-            proc = subprocess.run(cmd, capture_output=True, text=True,
-                                  check=False, timeout=limit)
-        except FileNotFoundError:
-            return Result(127, "", f"{cmd[0]}: command not found")
-        except subprocess.TimeoutExpired:
-            return Result(124, "",
-                          f"timed out after {limit:g}s: {format_cmd(cmd)}")
-        except OSError as exc:  # found, but not runnable (126, as a shell does)
-            return Result(126, "", f"{cmd[0]}: {exc}")
-        return Result(proc.returncode, (proc.stdout or "").strip(),
-                      (proc.stderr or "").strip())
-
-    def qout(self, *argv: object, timeout: float | None = None) -> str:
-        """Query, returning stdout only ('' on failure)."""
-        return self.q(*argv, timeout=timeout).stdout
-
-    # ------------------------------------------------------------------
-    # preconditions
-    # ------------------------------------------------------------------
-    def require_root(self) -> None:
-        if self.dry_run or self.listing:
-            return
-        if os.geteuid() != 0:
-            raise Abort("must be run as root (try: sudo ovnctl ...)")
-
-    def require_cmd(self, *cmds: str) -> None:
-        if self.listing:
-            return
-        missing = [c for c in cmds if shutil.which(c) is None]
-        if missing:
-            raise Abort(f"required command(s) not found: {' '.join(missing)}")
-
-    @staticmethod
-    def have(cmd: str) -> bool:
-        return shutil.which(cmd) is not None
-
-    # ------------------------------------------------------------------
-    # systemd
-    # ------------------------------------------------------------------
-    def unit_exists(self, unit: str) -> bool:
-        """Does a systemd unit exist?
-
-        NOT "systemctl list-unit-files | grep -q": grep exits on the first
-        match, systemctl takes SIGPIPE, and the pipeline then reports
-        failure despite matching. Query the one unit and read the output.
-        """
-        if not self.have("systemctl"):
-            return False
-        res = self.q("systemctl", "list-unit-files", f"{unit}.service",
-                     "--no-legend", "--no-pager")
-        return bool(res.stdout.strip())
-
-    def unit_active(self, unit: str) -> bool:
-        if not self.have("systemctl"):
-            return False
-        return self.q("systemctl", "is-active", "--quiet", unit).ok
+def _uuid_list(value) -> list[str]:
+    """An ovsdb reference column -- one uuid or a set of them -- as ids."""
+    if isinstance(value, list) and len(value) == 2:
+        if value[0] == "uuid":
+            return [str(value[1])]
+        if value[0] == "set":
+            return [str(v[1]) for v in value[1]
+                    if isinstance(v, list) and len(v) == 2 and v[0] == "uuid"]
+    return []
 
 
-def trace_verdict(output: str) -> str:
-    """ALLOW / DROP / UNKNOWN from an ovn-trace.
+#: Public alias -- other modules need to turn an ovsdb reference column
+#: into row ids without reaching for a private name.
+uuid_list = _uuid_list
 
-    A stateless drop prints "drop;". But as soon as any ACL uses
-    allow-related the pipeline is stateful and northd compiles a drop into
-    "ct_commit { ct_mark.blocked = 1; }" with no next/output -- the packet
-    still dies, it just never prints "drop;". Matching only "drop;" reports
-    those as ALLOW, which is the worst direction to be wrong in.
 
-    UNKNOWN exists because this used to return ALLOW for ANY output it did
-    not recognise -- including empty output. A trace that timed out, hit a
-    parse error, or never ran at all was therefore indistinguishable from
-    a packet that was permitted, and every caller reported it as a policy
-    failure. On a large Southbound db ovn-trace is slow enough for that to
-    be routine rather than exotic.
+def pg_snapshot(ctx: Ctx) -> dict[str, PortGroup]:
+    """Every port group in the NB db, members and ACLs resolved.
 
-    So the ALLOW verdict now requires positive evidence: real ovn-trace
-    output always contains an "ingress(dp=..." line. No pipeline, no
-    verdict.
+    Four queries regardless of how many groups exist, rather than three per
+    group. 'ports' and 'acls' are fetched separately on purpose: show.py
+    records that asking for both reference columns at once returned
+    unreliable results for one of them, and a silently short member list
+    would read as drift that isn't there.
+
+    Port_Group.ports holds row uuids; they are translated back to logical
+    port names here because that is what the inventory and the yaml speak.
     """
-    text = output.strip()
-    if not text:
-        return "UNKNOWN"
-    # ovn-trace prefixes its own errors this way; normal output never does.
-    for line in text.splitlines():
-        if line.startswith("ovn-trace:") or line.startswith("timed out"):
-            return "UNKNOWN"
-    if "ct_mark.blocked = 1" in output:
-        return "DROP"
-    for line in output.splitlines():
-        if re.match(r"^\s*drop;", line):
-            return "DROP"
-    if "ingress(dp=" not in output:
-        return "UNKNOWN"
-    return "ALLOW"
+    ports_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", "--columns=name,ports",
+                 "list", "Port_Group"), "name,ports")
+    acls_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", "--columns=name,acls",
+                 "list", "Port_Group"), "name,acls")
+    acl_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json",
+                 "--columns=_uuid,direction,priority,action,match", "list",
+                 "ACL"), "_uuid,direction,priority,action,match")
+    lsp_rows = _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", "--columns=_uuid,name", "list",
+                 "Logical_Switch_Port"), "_uuid,name")
+
+    lsp_name = {u: str(row[1]) for row in lsp_rows if len(row) >= 2
+                for u in _uuid_list(row[0])}
+    acl_by_uuid: dict[str, Acl] = {}
+    for row in acl_rows:
+        if len(row) < 5:
+            continue
+        for u in _uuid_list(row[0]):
+            acl_by_uuid[u] = Acl(str(row[1] or ""), str(row[2]),
+                                 str(row[3] or ""), str(row[4] or ""))
+
+    acls_of = {str(row[0]): _uuid_list(row[1])
+               for row in acls_rows if len(row) >= 2}
+
+    groups: dict[str, PortGroup] = {}
+    for row in ports_rows:
+        if len(row) < 2:
+            continue
+        name = str(row[0])
+        # An unresolvable member uuid is kept as the raw id rather than
+        # dropped: a port group pointing at a deleted port is a real fault
+        # and hiding it would make the group look correct.
+        groups[name] = PortGroup(
+            name=name,
+            ports=[lsp_name.get(u, u) for u in _uuid_list(row[1])],
+            acls=[acl_by_uuid[u] for u in acls_of.get(name, [])
+                  if u in acl_by_uuid],
+        )
+    return groups
+
+
+def acl_index(ctx: Ctx) -> dict[tuple[str, str, str], dict]:
+    """(direction, priority, match) -> the row's presentation columns.
+
+    That triple is what ovn-nbctl's --may-exist treats as an ACL's
+    identity, so it is the right key for "have I already created this
+    one, and does it carry the name, logging and meter I meant it to?".
+    """
+    index: dict[tuple[str, str, str], dict] = {}
+    cols = "_uuid,direction,priority,match,name,log,severity,meter"
+    for row in nb_json(ctx, cols, "ACL"):
+        if len(row) < 8:
+            continue
+        uuids = uuid_list(row[0])
+        if not uuids:
+            continue
+        key = (str(row[1] or ""), str(row[2]), str(row[3] or ""))
+        index[key] = {
+            "uuid": uuids[0],
+            "name": _scalar(row[4]),
+            "log": row[5] is True,
+            "severity": _scalar(row[6]),
+            "meter": _scalar(row[7]),
+        }
+    return index
+
+
+def _scalar(value) -> str:
+    """An optional ovsdb column: ['set', []] when unset, a bare value when
+    set. A bare str() of the unset form yields the literal "['set', []]"."""
+    if isinstance(value, list):
+        if len(value) == 2 and value[0] == "set":
+            return str(value[1][0]) if value[1] else ""
+        return ""
+    return str(value) if value is not None else ""
+
+
+# ovn-nbctl grew --name for acl-add alongside the ACL table's name column.
+# Probed once per process by trying it: a version check would have to map
+# release numbers to behaviour, and the command itself is authoritative.
+_acl_name_unsupported = False
+
+
+def add_acl(ctx: Ctx, group: str, direction: str, priority, match: str,
+            action: str, name: str = "", log: bool = False,
+            severity: str = "", meter: str = "") -> None:
+    """`ovn-nbctl acl-add` against a port group, with its presentation
+    options.
+
+    The name is what `ovnctl show` and `ovn-nbctl acl-list` print. Without
+    it every rule displays as '-' and the only way to tell two ACLs apart
+    is to read their match strings, which is exactly the situation the
+    declarative rule names exist to avoid.
+
+    log/severity/meter turn on ovn-controller's acl_log output for this
+    one ACL. The name matters twice over once logging is on: it is the
+    identifier that appears in every log line, so an unnamed logging ACL
+    produces records nobody can trace back to a rule.
+    """
+    global _acl_name_unsupported
+    head = ["ovn-nbctl", "--may-exist", "--type=port-group"]
+    if log:
+        head.append("--log")
+        if severity:
+            head.append(f"--severity={severity}")
+        if meter:
+            head.append(f"--meter={meter}")
+    tail = ["acl-add", group, direction, str(priority), match, action]
+
+    if name and not _acl_name_unsupported:
+        res = ctx.run(*head, f"--name={name}", *tail)
+        if res:
+            return
+        # Only treat this as a version problem if the complaint is about
+        # the option itself. Any other failure (a malformed match, a
+        # missing group) must surface as it always did rather than being
+        # silently retried into a differently-broken state.
+        if "name" not in (res.stderr or "").lower():
+            return
+        _acl_name_unsupported = True
+        ctx.warn("This ovn-nbctl does not accept --name on acl-add -- ACLs "
+                 "will be created unnamed and `ovnctl show` will print '-' "
+                 "in the NAME column.")
+
+    ctx.run(*head, *tail)
+
+
+def acl_list(ctx: Ctx, target: str) -> list[str]:
+    return ctx.q("ovn-nbctl", "acl-list", target).lines
+
+
+def policy_uuids(ctx: Ctx, priority: int | str) -> list[str]:
+    out = ctx.qout("ovn-nbctl", "--bare", "--columns=_uuid", "find",
+                   "Logical_Router_Policy", f"priority={priority}")
+    return [u for u in out.split() if u]
+
+
+def policies_with_match(ctx: Ctx, priority: int | str) -> list[tuple[str, str]]:
+    """(_uuid, match) pairs for every policy at this priority.
+
+    ``--bare --columns=_uuid,match`` emits one value per line with a blank
+    line between records, so records are paired up here rather than with
+    the shell version's ``paste - -`` (which silently mis-pairs whenever a
+    match contains a newline).
+    """
+    out = ctx.qout("ovn-nbctl", "--bare", "--columns=_uuid,match", "find",
+                   "Logical_Router_Policy", f"priority={priority}")
+    pairs: list[tuple[str, str]] = []
+    for record in out.split("\n\n"):
+        lines = [ln for ln in record.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            pairs.append((lines[0].strip(), lines[1].strip()))
+        elif len(lines) == 1:
+            pairs.append((lines[0].strip(), ""))
+    return pairs
+
+
+def port_security(ctx: Ctx, port: str) -> str:
+    return ctx.qout("ovn-nbctl", "--bare", "--columns=port_security", "list",
+                    "Logical_Switch_Port", port)
+
+
+def _json_rows(out: str, columns: str) -> list[list]:
+    """`--format=json` output -> rows, in the order the columns were asked for.
+
+    ovsdb reports what it actually returned in "headings"; keying off that
+    rather than trusting the order of --columns costs nothing and means a
+    reordered response cannot silently shift every field by one.
+    """
+    if not out:
+        return []
+    try:
+        parsed = json.loads(out)
+        data = parsed.get("data", [])
+        headings = parsed.get("headings", [])
+    except (ValueError, AttributeError):
+        return []
+    want = [c.strip() for c in columns.split(",")]
+    if headings and headings != want and all(c in headings for c in want):
+        idx = [headings.index(c) for c in want]
+        return [[row[i] if i < len(row) else "" for i in idx] for row in data]
+    return data
+
+
+def _json_map(value) -> list[tuple[str, str]]:
+    """An ovsdb map column (['map', [[k, v], ...]]) as pairs."""
+    if isinstance(value, list) and len(value) == 2 and value[0] == "map":
+        return [(str(p[0]), str(p[1])) for p in value[1] if len(p) == 2]
+    return []
+
+
+def ref_is_set(value) -> bool:
+    """True if an ovsdb reference column actually points at a row.
+
+    JSON renders an unset reference as ['set', []] and a set one as
+    ['uuid', '...']. A bare truthiness test calls the empty case True.
+    """
+    if isinstance(value, list) and len(value) == 2 and value[0] == "set":
+        return bool(value[1])
+    return bool(value)
+
+
+def nb_json(ctx: Ctx, columns: str, table: str, *extra: str) -> list[list]:
+    """`ovn-nbctl --format=json --columns=... list TABLE` -> rows."""
+    return _json_rows(
+        ctx.qout("ovn-nbctl", "--format=json", f"--columns={columns}",
+                 "list", table, *extra), columns)
+
+
+# ---------------------------------------------------------------------------
+# ovn-sbctl
+# ---------------------------------------------------------------------------
+def chassis_names(ctx: Ctx) -> list[str]:
+    return ctx.q("ovn-sbctl", "--bare", "--columns=name", "list", "Chassis").lines
+
+
+def first_chassis(ctx: Ctx) -> str:
+    """The first registered chassis name.
+
+    DO NOT use this to decide what to pin a gateway port to. On a host that
+    has drifted there may be a stale row and the 'first' one is whichever
+    the db happens to return -- pinning to it is how a pin ends up
+    referencing a chassis that no longer exists. Use
+    identity.pin_target() instead; this stays for read-only reporting.
+    """
+    names = chassis_names(ctx)
+    return names[0] if names else ""
+
+
+def chassis_uuid_names(ctx: Ctx) -> dict[str, str]:
+    """Chassis row uuid -> chassis name.
+
+    Port_Binding.chassis is a row reference, not a name, so any check that
+    wants to know WHICH chassis a port is bound to has to resolve it.
+    """
+    out: dict[str, str] = {}
+    for row in sb_json(ctx, "_uuid,name", "Chassis"):
+        if len(row) < 2:
+            continue
+        uuids = _uuid_list(row[0])
+        if uuids:
+            out[uuids[0]] = str(row[1] or "")
+    return out
+
+
+def port_binding_chassis(ctx: Ctx, logical_port: str) -> str:
+    return ctx.qout("ovn-sbctl", "--bare", "--columns=chassis", "find",
+                    "Port_Binding", f"logical_port={logical_port}").strip()
+
+
+def port_binding_chassis_name(ctx: Ctx, logical_port: str) -> str:
+    """The NAME of the chassis a port is bound to ('' if unbound).
+
+    A binding row survives a reboot, so 'has a chassis' is not the same
+    question as 'is bound to the chassis this host is currently running
+    as'. Only the name can tell those apart.
+    """
+    uuid = port_binding_chassis(ctx, logical_port)
+    if not uuid or uuid == "[]":
+        return ""
+    return chassis_uuid_names(ctx).get(uuid, uuid[:12])
+
+
+def port_binding_type(ctx: Ctx, logical_port: str) -> str:
+    return ctx.qout("ovn-sbctl", "--bare", "--columns=type", "find",
+                    "Port_Binding", f"logical_port={logical_port}").strip()
+
+
+def port_binding_ports(ctx: Ctx) -> list[str]:
+    return ctx.q("ovn-sbctl", "--bare", "--columns=logical_port", "list",
+                 "Port_Binding").lines
+
+
+def sb_json(ctx: Ctx, columns: str, table: str, *extra: str) -> list[list]:
+    """`ovn-sbctl --format=json --columns=... list TABLE` -> rows.
+
+    Preferred over sb_records() for multi-column reads: --bare prints an
+    empty column as a blank line and uses a blank line as the record
+    separator too, so an empty column in the MIDDLE of the list (a VIF's
+    'type', an unbound port's 'chassis') is indistinguishable from the end
+    of a record. JSON has no such ambiguity.
+    """
+    return _json_rows(
+        ctx.qout("ovn-sbctl", "--format=json", f"--columns={columns}",
+                 "list", table, *extra), columns)
+
+
+def sb_records(ctx: Ctx, columns: str, table: str,
+               *find: str) -> list[list[str]]:
+    """`ovn-sbctl --bare --columns=a,b find TABLE ...` -> list of records.
+
+    Records are separated by blank lines and each column is on its own
+    line. A VIF's 'type' column is an EMPTY STRING, which --bare prints as
+    a blank line -- and a blank line is also the record separator. The
+    shell version's ``awk RS=""`` split every VIF record in half because of
+    this; here the record shape is reconstructed by padding short records
+    instead of assuming they are well-formed.
+    """
+    ncols = len(columns.split(","))
+    verb = "find" if find else "list"
+    out = ctx.qout("ovn-sbctl", "--bare", f"--columns={columns}", verb, table,
+                   *find)
+    records: list[list[str]] = []
+    for record in out.split("\n\n"):
+        if not record.strip():
+            continue
+        fields = record.splitlines()
+        fields += [""] * (ncols - len(fields))
+        records.append([f.strip() for f in fields[:ncols]])
+    return records
+
+
+# ---------------------------------------------------------------------------
+# northd synchronisation
+# ---------------------------------------------------------------------------
+def sync_sb(ctx: Ctx, timeout: int = 30) -> bool:
+    """Block until ovn-northd has compiled the NB db into the SB db.
+
+    ovn-nbctl returns as soon as the Northbound db is written. northd then
+    compiles that into Southbound logical flows asynchronously, and
+    ovn-trace reads the SOUTHBOUND db -- so a trace run immediately after
+    creating an ACL can legitimately report the behaviour from before it
+    existed. That is not a flaky test, it is a race, and on a busy or
+    freshly-purged db the window is comfortably long enough to hit.
+
+    `--wait=sb sync` is the supported way to close it: it returns when
+    northd has caught up with everything written so far.
+    """
+    res = ctx.q("ovn-nbctl", f"--timeout={timeout}", "--wait=sb", "sync",
+                timeout=timeout + 5)
+    if not res.ok:
+        ctx.warn(f"ovn-nbctl --wait=sb sync did not complete in {timeout}s -- "
+                 "northd may be down or behind.")
+        ctx.warn("Any verification that follows is reading a Southbound db "
+                 "that is not up to date.")
+    return res.ok
+
+
+# ---------------------------------------------------------------------------
+# ovn-trace
+# ---------------------------------------------------------------------------
+#: ovn-trace walks the whole compiled pipeline, so it gets slower as the
+#: deployment grows -- on a few hundred thousand flows it can take tens of
+#: seconds. The default 15s query ceiling was low enough to time this out
+#: routinely, and a timed-out trace produced empty output that every
+#: caller then read as ALLOW.
+TRACE_TIMEOUT = 60
+
+
+def trace(ctx: Ctx, datapath: str, expr: str,
+          timeout: float = TRACE_TIMEOUT) -> str:
+    """Run ovn-trace and return combined output (stderr included).
+
+    ovn-trace reports parse errors on stderr, and a trace that failed to
+    parse -- or to finish -- must not be read as ALLOW. Pair this with
+    trace_verdict, which returns UNKNOWN rather than guessing.
+    """
+    res = ctx.q("ovn-trace", datapath, expr, timeout=timeout)
+    return "\n".join(p for p in (res.stdout, res.stderr) if p)
