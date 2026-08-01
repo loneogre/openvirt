@@ -28,7 +28,7 @@ import re
 import time
 from pathlib import Path
 
-from .. import libvirtutil, ovn
+from .. import libvirtutil, ovn, paths
 from ..context import Ctx
 from ..state import Tracker
 from ..steps import StepRunner, add_step_args
@@ -49,16 +49,23 @@ def register(subparsers) -> argparse.ArgumentParser:
                    help="also wipe the raw NB/SB database files")
     p.add_argument("--keep-br-int", action="store_true",
                    help="leave br-int in place")
+    p.add_argument("--forget-user-vms", action="store_true",
+                   help="also discard the user-VM slot allocations "
+                        "(state/user-vms.json). Without this they are kept, "
+                        "and `ovnctl deploy` rebuilds those slots with the "
+                        "same UUIDs and MACs")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
 
 
 class Teardown:
-    def __init__(self, ctx: Ctx, purge_db: bool, keep_br_int: bool):
+    def __init__(self, ctx: Ctx, purge_db: bool, keep_br_int: bool,
+                 forget_user_vms: bool = False):
         self.ctx = ctx
         self.purge_db = purge_db
         self.keep_br_int = keep_br_int
+        self.forget_user_vms = forget_user_vms
         self.br_int = ctx.config.cfg_opt("topology", "br_int", DEFAULT_BR_INT)
 
     # ------------------------------------------------------------------
@@ -580,6 +587,58 @@ class Teardown:
     def clear_tracker(self) -> None:
         Tracker(self.ctx).clear()
         self.report("Deployment tracker:", "erased")
+        self._user_vm_allocations()
+
+    def _user_vm_allocations(self) -> None:
+        """Report -- and optionally discard -- the user-VM slot records.
+
+        They are KEPT by default, and deliberately: an operator's libvirt
+        domain references a slot's UUID and MAC by value, so discarding
+        the record would orphan somebody else's VM. `deploy` rebuilds the
+        slots from it with the same identities, which is the whole point
+        of the file surviving a purge.
+
+        But it is surprising if nobody says so -- a teardown that reports
+        everything else as removed, followed by a deploy that recreates
+        ten ports out of apparently nowhere, reads as a bug.
+        """
+        import json
+
+        ctx = self.ctx
+        path = paths.state_dir() / "user-vms.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.report("User-VM allocations:", "none recorded")
+            return
+        count = len(data.get("slots") or {})
+        if not count:
+            self.report("User-VM allocations:", "none recorded")
+            return
+
+        if not self.forget_user_vms:
+            self.report("User-VM allocations:",
+                        f"{count} slot(s) KEPT ({path.name})")
+            ctx.log("  Their UUIDs and MACs are referenced by libvirt domains, "
+                    "so they")
+            ctx.log("  survive a teardown. `ovnctl deploy` rebuilds them "
+                    "identically.")
+            ctx.log("  Use --forget-user-vms to discard them instead.")
+            return
+
+        if ctx.dry_run:
+            print(f"rm -f {path}")
+        else:
+            try:
+                path.unlink()
+            except OSError as exc:
+                ctx.warn(f"Could not remove {path}: {exc}")
+                return
+            ctx.changes += 1
+        self.report("User-VM allocations:", f"{count} slot(s) DISCARDED")
+        ctx.warn("Any libvirt domain still pointing at those interface UUIDs "
+                 "now references a port that will never exist. Re-create the "
+                 "slots and update the domain XML.")
 
     def final_show(self) -> None:
         ctx = self.ctx
@@ -595,7 +654,8 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.load_config("ovn-teardown")
     ctx.require_root()
 
-    t = Teardown(ctx, args.purge_db, args.keep_br_int)
+    t = Teardown(ctx, args.purge_db, args.keep_br_int,
+                 getattr(args, "forget_user_vms", False))
     runner = StepRunner(ctx, "delete")
     runner.add("host-networking", "flush addresses/routes on br-int internal ports",
                t.host_networking)

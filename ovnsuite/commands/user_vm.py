@@ -386,6 +386,7 @@ class UserVM:
 
         ctx.dr_head(f"Create {name}")
         self.wire_port(name, port_uuid, mac, ip, access)
+        self.sync_pg_members(extra=port_uuid)
 
         record = {
             "name": name,
@@ -417,8 +418,6 @@ class UserVM:
         ctx.run("ovn-nbctl", "lsp-set-port-security", port_uuid, f"{mac} {ip}")
         ctx.run("ovn-nbctl", "set", "Logical_Switch_Port", port_uuid,
                 f"external-ids:vm-name={name}")
-        self.sync_pg_members(extra=port_uuid)
-
         self.access_acls(name, port_uuid, access)
 
     def sync_pg_members(self, extra: str = "",
@@ -580,6 +579,17 @@ class UserVM:
             ctx.dr_head(f"Reapply {record['name']}")
             self.wire_port(record["name"], record["uuid"], record["mac"],
                            record["ip"], record.get("access", []))
+
+        # ONCE, and only after every port exists.
+        #
+        # This used to run inside wire_port, i.e. once per slot. On the
+        # first slot the other nine logical ports had not been created
+        # yet, so pg-set-ports -- which sets membership wholesale and
+        # therefore names all ten -- failed with "port UUID not found",
+        # nine times, and only succeeded on the last iteration. The end
+        # state was correct and the output was nine alarming warnings
+        # about isolation not being applied.
+        self.sync_pg_members()
         ctx.log(f"Rebuilt {len(records)} slot(s) from {self.alloc.path}.")
         return 0
 
