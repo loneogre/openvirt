@@ -111,6 +111,10 @@ class Setup:
         ctx.dr_head("OVS external-ids")
         ctx.log("Reconciling OVS external-ids...")
 
+        # Captured BEFORE the write, because "was it unset" and "was it a
+        # different value" call for opposite responses below.
+        previous_id = identity.local(ctx)
+
         id_changed = identity.assert_external_ids(
             ctx, self.system_id, self.ovn_remote, self.encap_type,
             self.encap_ip)
@@ -134,7 +138,21 @@ class Setup:
         # because teardown clears external-ids and so system-id always
         # "changes". Restarting unconditionally there turned a working
         # deploy into one that needed a second vm-attach run.
-        if identity.wait_for_chassis(ctx, self.system_id, timeout=20):
+        # How long to give it before resorting to a restart depends on
+        # what it was doing beforehand:
+        #
+        #   previously SET to something else -- the controller is running
+        #     and registered under the old name. It usually notices the
+        #     change and re-registers on its own, so wait properly.
+        #
+        #   previously UNSET -- which is the state `delete --purge-db`
+        #     leaves behind, since teardown clears external-ids. A
+        #     controller with no system-id has no identity to register
+        #     under and is doing nothing at all. Waiting 20s for it is 20s
+        #     of guaranteed delay on every post-teardown deploy, and then
+        #     restarting anyway.
+        patience = 20 if previous_id else 3
+        if identity.wait_for_chassis(ctx, self.system_id, timeout=patience):
             ctx.log(f"ovn-controller registered as '{self.system_id}' without "
                     "a restart.")
             return
@@ -143,10 +161,14 @@ class Setup:
             ctx.log("ovn-controller is not running -- nothing to restart.")
             return
 
-        ctx.warn(f"ovn-controller did not register as '{self.system_id}' "
-                 "within 20s of the change --")
-        ctx.warn("restarting it. Expect the first port claims to be slow "
-                 "while it rebuilds.")
+        if previous_id:
+            ctx.warn(f"ovn-controller did not register as '{self.system_id}' "
+                     f"within {patience}s of the change -- restarting it.")
+        else:
+            ctx.log("external-ids had no system-id (the state a teardown "
+                    "leaves), so the")
+            ctx.log("controller had no identity to register under. "
+                    "Restarting it.")
         identity.restart_controller(ctx, "system-id changed")
         if not identity.wait_for_chassis(ctx, self.system_id, timeout=60):
             ctx.warn(f"ovn-controller has not registered as "
