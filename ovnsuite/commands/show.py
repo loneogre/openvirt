@@ -776,7 +776,15 @@ def show_acls() -> None:
         print(f"\nPORT GROUP: {pg_name:<25} Members: {len(ports)}  "
               f"Total ACLs: {len(refs)}")
         if member_names:
-            print("  Member ports: " + ", ".join(member_names))
+            # One per line. A comma-joined list of six members and their
+            # uuids ran past 300 characters and wrapped wherever the
+            # terminal happened to be, which made it impossible to read a
+            # membership off the screen or to diff two runs of this
+            # command. Sorted, because the db returns them in row order --
+            # arbitrary, and it changes as ports are added and removed.
+            print("  Member ports:")
+            for name in sorted(member_names):
+                print(f"    * {name}")
         print("  " + "-" * 126)
         total_pg += _print_acl_rows(refs, acl_details)
 
