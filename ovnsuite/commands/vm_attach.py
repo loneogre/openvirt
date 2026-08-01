@@ -440,6 +440,14 @@ class VMAttach:
         the one that matters.
         """
         ctx = self.ctx
+        # A live-state report, not a command. Under --dry-run it would be
+        # printed into `ovnctl runbook`'s output, which captures stdout to
+        # build a shell script -- a table of port bindings in the middle of
+        # one is at best confusing and at worst breaks it.
+        if ctx.dry_run:
+            ctx.log("(status table omitted in dry-run: it reports live state, "
+                    "not commands)")
+            return
         chassis_names = ovn.chassis_uuid_names(ctx)
         print("")
         print("=== Port binding status ===")
