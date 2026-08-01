@@ -217,8 +217,17 @@ class Ctx:
     # command execution
     # ------------------------------------------------------------------
     def run(self, *argv: object, check: bool = False,
-            stdin: str | None = None) -> Result:
-        """A MUTATING command: printed under --dry-run, executed otherwise."""
+            stdin: str | None = None,
+            timeout: float | None = None) -> Result:
+        """A MUTATING command: printed under --dry-run, executed otherwise.
+
+        timeout is optional and defaults to none, because most mutations
+        are ovn-nbctl calls that either return promptly or fail. Pass one
+        for anything that talks to a DAEMON'S CONTROL SOCKET -- ovn-appctl
+        in particular, which blocks indefinitely when ovn-controller is
+        too busy to service it, and which will therefore hang a whole
+        deploy at the exact moment the system is already struggling.
+        """
         cmd = [str(a) for a in argv]
         if self.dry_run:
             print(format_cmd(cmd))
@@ -226,8 +235,14 @@ class Ctx:
         self.changes += 1
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, text=True, input=stdin, check=False
+                cmd, capture_output=True, text=True, input=stdin, check=False,
+                timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            # rc 124 matches timeout(1), so callers that only test .ok
+            # behave as they always did.
+            return Result(124, "", f"timed out after {timeout}s: "
+                                   f"{format_cmd(cmd)}")
         except FileNotFoundError:
             res = Result(127, "", f"{cmd[0]}: command not found")
             if check:

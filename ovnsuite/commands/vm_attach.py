@@ -265,8 +265,8 @@ class VMAttach:
             ctx.warn("         systemctl status ovn-controller")
             return
 
-        conn = ctx.qout("ovn-appctl", "-t", "ovn-controller",
-                        "connection-status").strip()
+        conn = ctx.qout("ovn-appctl", "--timeout=5", "-t", "ovn-controller",
+                        "connection-status", timeout=10).strip()
         ctx.warn(f"      SB connection       : {conn or 'unknown'}")
         if not conn:
             # An empty answer usually means the controller is too busy to

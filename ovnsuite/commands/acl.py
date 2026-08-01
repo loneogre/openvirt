@@ -252,8 +252,22 @@ class ACLManager:
         # boot; without that the logging silently stops at the next
         # restart while the ACLs still say log=true.
         if ctx.have("ovn-appctl"):
-            if not ctx.run("ovn-appctl", "-t", "ovn-controller", "vlog/set",
-                           f"acl_log:syslog:{self.log_severity}"):
+            # Time-boxed twice over: --timeout is ovn-appctl's own, and the
+            # subprocess timeout catches the case where it ignores it.
+            # Without this the step hangs forever whenever ovn-controller
+            # is rebuilding, which is precisely when a deploy is running.
+            res = ctx.run("ovn-appctl", "--timeout=5", "-t", "ovn-controller",
+                          "vlog/set", f"acl_log:syslog:{self.log_severity}",
+                          timeout=10)
+            if res.returncode == 124:
+                ctx.warn("ovn-controller did not answer within 10s -- it is "
+                         "busy, not broken.")
+                ctx.warn("The ACLs are deployed and logging is enabled on "
+                         "them; only the vlog")
+                ctx.warn("level was not raised, so records may not reach "
+                         "syslog yet. Re-run:")
+                ctx.warn("  ovnctl acl --only log-sink")
+            elif not res:
                 ctx.warn("Could not set the acl_log vlog level -- is "
                          "ovn-controller running?")
         else:
@@ -292,7 +306,7 @@ class ACLManager:
             return
         ctx.changes += 1
         ctx.log(f"Wrote {path} -> {target}")
-        if not ctx.run("systemctl", "restart", "rsyslog"):
+        if not ctx.run("systemctl", "restart", "rsyslog", timeout=30):
             ctx.warn("Could not restart rsyslog -- the rule is written but "
                      "not loaded.")
 

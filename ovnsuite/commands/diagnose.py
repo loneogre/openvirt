@@ -362,8 +362,9 @@ class Diagnose:
                 "| xargs -r -n1 ovn-sbctl destroy Chassis_Private",
                 "     systemctl start ovn-controller")
         elif ctx.have("ovn-appctl"):
-            conn = ctx.qout("ovn-appctl", "-t", "ovn-controller",
-                            "connection-status")
+            conn = ctx.qout("ovn-appctl", "--timeout=5", "-t",
+                            "ovn-controller", "connection-status",
+                            timeout=10)
             if conn and "connected" not in conn:
                 self.bad(f"ovn-controller is running but its SB connection is "
                          f"'{conn}'.")

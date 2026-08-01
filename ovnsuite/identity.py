@@ -188,7 +188,10 @@ def restart_controller(ctx: Ctx, reason: str = "") -> bool:
     if reason:
         ctx.log(f"Restarting ovn-controller: {reason}")
     if ctx.have("systemctl") and ctx.unit_exists("ovn-controller"):
-        if ctx.run("systemctl", "restart", "ovn-controller"):
+        # ovn-ctl's stop regularly fails to exit cleanly and gets
+        # SIGKILLed after its own alarm; systemctl then waits on the unit.
+        # Bounded so a stuck restart cannot hold a deploy open forever.
+        if ctx.run("systemctl", "restart", "ovn-controller", timeout=120):
             return True
         ctx.warn("systemctl could not restart ovn-controller.")
         return False

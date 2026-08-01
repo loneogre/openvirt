@@ -259,8 +259,8 @@ class Reconcile:
             ctx.log("No ACL has logging enabled -- nothing to re-assert.")
             return
         severity = ctx.config.cfg_opt("acl_log", "severity", "info")
-        if ctx.run("ovn-appctl", "-t", "ovn-controller", "vlog/set",
-                   f"acl_log:syslog:{severity}"):
+        if ctx.run("ovn-appctl", "--timeout=5", "-t", "ovn-controller",
+                   "vlog/set", f"acl_log:syslog:{severity}", timeout=10):
             ctx.log(f"acl_log vlog level re-applied ({severity}).")
         else:
             ctx.warn("Could not re-apply the acl_log vlog level; ACL records "
