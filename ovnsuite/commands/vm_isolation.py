@@ -307,6 +307,15 @@ class VMIsolation:
             return
         ctx.log("Verifying ACL scope (non-members must be unaffected)...")
 
+        # ovn-trace reads the SOUTHBOUND db. The ACLs above were written to
+        # the NORTHBOUND db moments ago and northd compiles between the two
+        # asynchronously, so tracing straight away can report the pipeline
+        # as it was before those ACLs existed. Wait for northd first --
+        # otherwise this reports "member was NOT blocked" on a deployment
+        # that is completely correct, which is what it used to do on every
+        # first run.
+        ovn.sync_sb(ctx)
+
         if not ctx.have("ovn-trace"):
             ctx.warn("ovn-trace not available -- cannot verify scope automatically.")
             ctx.warn("Manually confirm a NON-member is still reachable before "
@@ -353,23 +362,41 @@ class VMIsolation:
         ctx.log(f"  OK: non-member {victim.name} is NOT affected by the "
                 "isolation ACLs.")
 
-        # And confirm a member IS still blocked (isolation actually works).
-        m_name, m_uuid, m_ip = self.isolated[0]
-        member = self.inv.by_uuid(m_uuid)
-        if member is None:
+        # And confirm the members ARE blocked (isolation actually works).
+        #
+        # Every member, not just the first. Probing self.isolated[0] alone
+        # meant the message always named the same VM, which read as "this
+        # one VM is special" when it only ever meant "index zero" -- and it
+        # said nothing at all about the other three.
+        blocked: list[str] = []
+        unblocked: list[str] = []
+        for m_name, m_uuid, m_ip in self.isolated:
+            member = self.inv.by_uuid(m_uuid)
+            if member is None:
+                continue
+            target = m_ip or member.ip
+            expr = (f'inport=="{self.ls_ext}-to-lr" && eth.src=={lrp_ext_mac} && '
+                    f'eth.dst=={member.mac} && ip4.src=={host_ip} && '
+                    f'ip4.dst=={target} && ip.ttl==63 && icmp4')
+            out = ovn.trace(ctx, self.ls_ext, expr)
+            if trace_verdict(out) == "DROP":
+                blocked.append(m_name)
+            else:
+                unblocked.append(f"{m_name} ({target})")
+
+        if blocked:
+            ctx.log(f"  OK: {len(blocked)} member(s) correctly blocked from "
+                    f"internal: {', '.join(blocked)}")
+        if not unblocked:
             return
-        ctx.log(f"  probing member {m_name} ({m_ip or member.ip}) -- expected "
-                "to be blocked...")
-        expr = (f'inport=="{self.ls_ext}-to-lr" && eth.src=={lrp_ext_mac} && '
-                f'eth.dst=={member.mac} && ip4.src=={host_ip} && '
-                f'ip4.dst=={m_ip or member.ip} && ip.ttl==63 && icmp4')
-        out = ovn.trace(ctx, self.ls_ext, expr)
-        if trace_verdict(out) == "DROP":
-            ctx.log(f"  OK: member {m_name} is correctly blocked from internal.")
-        else:
-            ctx.warn(f"Member {m_name} was NOT blocked -- isolation may not be "
-                     "effective.")
-            ctx.warn(f"Check: ovn-nbctl acl-list {self.pg_name}")
+
+        ctx.warn(f"{len(unblocked)} member(s) NOT blocked -- isolation may not "
+                 "be effective:")
+        for entry in unblocked:
+            ctx.warn(f"  {entry}")
+        ctx.warn(f"Check: ovn-nbctl acl-list {self.pg_name}")
+        ctx.warn(f"       ovn-nbctl --wait=sb sync   (then re-run "
+                 "`ovnctl vm-isolation --only verify-scope`)")
 
     # ------------------------------------------------------------------
     def run_trace(self, src: str, dst: str) -> None:

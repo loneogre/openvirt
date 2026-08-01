@@ -529,6 +529,12 @@ class ACLManager:
         ctx = self.ctx
         ctx.require_cmd("ovn-trace")
 
+        # ovn-trace reads the Southbound db, which northd populates from
+        # the Northbound one asynchronously. Verifying immediately after
+        # applying rules can therefore trace the pipeline as it was before
+        # they existed and report failures that are pure timing.
+        ovn.sync_sb(ctx)
+
         if len(self.inv.internal) < 2 or len(self.inv.external) < 1:
             raise Abort("Need at least 2 internal and 1 external VM in the "
                         "inventory.")

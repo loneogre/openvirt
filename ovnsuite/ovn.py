@@ -495,6 +495,32 @@ def sb_records(ctx: Ctx, columns: str, table: str,
 
 
 # ---------------------------------------------------------------------------
+# northd synchronisation
+# ---------------------------------------------------------------------------
+def sync_sb(ctx: Ctx, timeout: int = 30) -> bool:
+    """Block until ovn-northd has compiled the NB db into the SB db.
+
+    ovn-nbctl returns as soon as the Northbound db is written. northd then
+    compiles that into Southbound logical flows asynchronously, and
+    ovn-trace reads the SOUTHBOUND db -- so a trace run immediately after
+    creating an ACL can legitimately report the behaviour from before it
+    existed. That is not a flaky test, it is a race, and on a busy or
+    freshly-purged db the window is comfortably long enough to hit.
+
+    `--wait=sb sync` is the supported way to close it: it returns when
+    northd has caught up with everything written so far.
+    """
+    res = ctx.q("ovn-nbctl", f"--timeout={timeout}", "--wait=sb", "sync",
+                timeout=timeout + 5)
+    if not res.ok:
+        ctx.warn(f"ovn-nbctl --wait=sb sync did not complete in {timeout}s -- "
+                 "northd may be down or behind.")
+        ctx.warn("Any verification that follows is reading a Southbound db "
+                 "that is not up to date.")
+    return res.ok
+
+
+# ---------------------------------------------------------------------------
 # ovn-trace
 # ---------------------------------------------------------------------------
 def trace(ctx: Ctx, datapath: str, expr: str) -> str:
