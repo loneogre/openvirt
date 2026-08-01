@@ -16,10 +16,13 @@ Rule format:
     spec       src=CIDR[,CIDR]   dst=CIDR[,CIDR]   src=any
                src=internal / dst=internal  expands to [internal_ranges]
                tcp=PORT | tcp=@portset   udp=PORT | udp=@portset   icmp
+               log            log every packet this rule matches
+               log=SEVERITY   the same, at alert|warning|notice|info|debug
+               meter=NAME     rate-limit this rule's logging with a meter
 
-Per-ACL logging was removed while investigating ovn-controller memory
-use. The rules, names and priorities are unchanged; nothing writes
-acl_log records. See ovn-settings.yaml for how to bring it back.
+Logging is per rule and off by default: on a busy segment an allow rule
+that logs is a firehose. See [acl_log] in ovn-settings.yaml for where the
+records end up.
 
 Higher priority wins. Anything with no matching rule is ALLOWED (OVN's
 default), so these rules only constrain what they name.
@@ -43,6 +46,19 @@ HELP = "declarative micro-segmentation ACLs"
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 
+# ovn-controller's acl_log severities, in the order OVN documents them.
+SEVERITIES = ("alert", "warning", "notice", "info", "debug")
+
+# Written to /etc/rsyslog.d/. The 'stop' matters: without it every ACL
+# record is ALSO appended to /var/log/messages, which is how a chatty
+# allow rule takes out the system log rather than just its own file.
+RSYSLOG_CONF = """\
+# Managed by ovnctl acl. Do not edit -- rewritten on every run.
+# ovn-controller emits ACL records through its vlog 'acl_log' module.
+:msg, contains, "acl_log" {target}
+& stop
+"""
+
 
 
 @dataclass
@@ -62,6 +78,11 @@ class ParsedRule:
     raw: str
     index: int = 0
     error: str = ""
+    # Logging is a property of the rule, not of the match, so these are
+    # split out of the spec tokens before the match is built.
+    log: bool = False
+    severity: str = ""
+    meter: str = ""
 
 
 def register(subparsers) -> argparse.ArgumentParser:
@@ -95,6 +116,23 @@ class ACLManager:
         self.group_defs = [self._split2(d) for d in c.cfg_list("acls", "port_groups")]
         self.rules = c.cfg_list("acls", "rules")
         self.verify_pairs = c.cfg_list("acls", "verify_pairs")
+
+        # --- [acl_log] --------------------------------------------------
+        # Defaults for any rule that says 'log' without saying more. The
+        # meter is applied to every logging rule unless one names its own,
+        # because an unmetered logging ACL on a busy segment can fill a
+        # disk faster than anyone notices.
+        self.log_severity = c.cfg_opt("acl_log", "severity", "info")
+        if self.log_severity not in SEVERITIES:
+            ctx.warn(f"[acl_log].severity '{self.log_severity}' is not one of "
+                     f"{', '.join(SEVERITIES)} -- using 'info'.")
+            self.log_severity = "info"
+        self.meter_name = c.cfg_opt("acl_log", "meter", "acl-log-meter")
+        self.log_rate = c.cfg_opt("acl_log", "rate_pps", "100")
+        self.log_burst = c.cfg_opt("acl_log", "burst", "50")
+        self.log_dir = c.cfg_opt("acl_log", "directory", "/var/log/ovn-acl")
+        self.log_file = c.cfg_opt("acl_log", "filename", "acl.log")
+        self.manage_sink = c.cfg_bool("acl_log", "manage_sink", True)
 
 
         self.inv = Inventory(c, self.ls_int, self.ls_ext)
@@ -160,6 +198,132 @@ class ACLManager:
         return match
 
     # ------------------------------------------------------------------
+    # logging
+    # ------------------------------------------------------------------
+    def logging_rules(self) -> list[ParsedRule]:
+        return [r for r in self.parsed_rules() if r.log and not r.error]
+
+    def log_meter(self) -> None:
+        """Create the meter that rate-limits acl_log output.
+
+        Without one, a logging ACL writes a line per matching packet. That
+        is fine for a drop rule nobody expects to fire and catastrophic for
+        an allow rule on a busy segment -- it is the same disk the captures
+        are going to.
+        """
+        ctx = self.ctx
+        wanted = {r.meter for r in self.logging_rules() if r.meter}
+        if not wanted:
+            ctx.log("No logging rules -- no meter needed.")
+            return
+        ctx.dr_head("ACL log rate-limiting")
+        for meter in sorted(wanted):
+            # --may-exist leaves an existing meter's rate alone, which is
+            # what you want: someone may have tuned it by hand after
+            # watching the real volume.
+            ctx.run("ovn-nbctl", "--may-exist", "meter-add", meter, "drop",
+                    self.log_rate, "pktps", self.log_burst)
+            ctx.log(f"  meter {meter}: {self.log_rate} pkt/s, "
+                    f"burst {self.log_burst}")
+
+    def log_sink(self) -> None:
+        """Point acl_log records at a file of our own.
+
+        OVN has no per-ACL log destination. `log=true` makes ovn-controller
+        emit an acl_log record through its own vlog, and that is the end of
+        what OVN offers -- the records land wherever ovn-controller's log
+        goes, mixed in with everything else it has to say.
+
+        So the directory in [acl_log] is implemented with rsyslog: tell
+        ovn-controller to send acl_log to syslog, and give rsyslog a rule
+        that files anything containing 'acl_log' separately and stops it
+        propagating to /var/log/messages. The alternative -- repointing
+        ovn-controller's --log-file -- would move ALL of its output, not
+        just the ACL records.
+        """
+        ctx = self.ctx
+        if not self.log_sink_wanted():
+            return
+
+        ctx.dr_head("ACL log sink")
+        target = f"{self.log_dir}/{self.log_file}"
+        ctx.run("mkdir", "-p", self.log_dir)
+
+        # vlog levels are runtime state and do NOT survive an
+        # ovn-controller restart. `ovnctl reconcile` re-applies this at
+        # boot; without that the logging silently stops at the next
+        # restart while the ACLs still say log=true.
+        if ctx.have("ovn-appctl"):
+            res = ovn.appctl(ctx, "vlog/set",
+                             f"acl_log:syslog:{self.log_severity}")
+            if res.returncode == 124:
+                ctx.warn("ovn-controller did not answer within 10s -- it is "
+                         "busy, not broken.")
+                ctx.warn("The ACLs are deployed and logging is enabled on "
+                         "them; only the vlog")
+                ctx.warn("level was not raised, so records may not reach "
+                         "syslog yet. Re-run:")
+                ctx.warn("  ovnctl acl --only log-sink")
+            elif not res:
+                ctx.warn("Could not set the acl_log vlog level.")
+                ctx.warn(f"  socket: {ovn.controller_ctl(ctx) or 'NOT FOUND'}")
+                if res.stderr:
+                    ctx.warn(f"  ovn-appctl: {res.stderr.splitlines()[0]}")
+                ctx.warn("  ACL logging is enabled on the rules regardless; "
+                         "only the vlog")
+                ctx.warn("  level is unset, so records may not reach syslog.")
+        else:
+            ctx.warn("ovn-appctl not found -- cannot raise the acl_log vlog "
+                     "level, so records may never reach syslog.")
+
+        if not ctx.have("rsyslogd"):
+            ctx.warn("rsyslogd not found. ACL records will go to "
+                     "ovn-controller's own log")
+            ctx.warn(f"instead of {target}. Set [acl_log].manage_sink: false "
+                     "to stop this warning,")
+            ctx.warn("or file them yourself from journalctl -u ovn-controller.")
+            return
+
+        conf = RSYSLOG_CONF.format(target=target)
+        path = "/etc/rsyslog.d/10-ovn-acl.conf"
+        if ctx.dry_run:
+            print(f"cat > {path} <<'EOF'")
+            print(conf, end="")
+            print("EOF")
+            ctx.run("systemctl", "restart", "rsyslog")
+            return
+
+        from pathlib import Path
+        try:
+            existing = Path(path).read_text(encoding="utf-8")
+        except OSError:
+            existing = ""
+        if existing == conf:
+            ctx.log(f"{path} is already correct.")
+            return
+        try:
+            Path(path).write_text(conf, encoding="utf-8")
+        except OSError as exc:
+            ctx.warn(f"Could not write {path}: {exc}")
+            return
+        ctx.changes += 1
+        ctx.log(f"Wrote {path} -> {target}")
+        if not ctx.run("systemctl", "restart", "rsyslog", timeout=30):
+            ctx.warn("Could not restart rsyslog -- the rule is written but "
+                     "not loaded.")
+
+    def log_sink_wanted(self) -> bool:
+        ctx = self.ctx
+        if not self.logging_rules():
+            ctx.log("No rule requests logging -- not touching the log sink.")
+            return False
+        if not self.manage_sink:
+            ctx.log("[acl_log].manage_sink is false -- leaving syslog "
+                    "configuration alone.")
+            return False
+        return True
+
+    # ------------------------------------------------------------------
     # apply
     # ------------------------------------------------------------------
     def port_groups(self) -> None:
@@ -210,9 +374,49 @@ class ACLManager:
                     "<action> <group> [spec...]"))
                 continue
             name, direction, priority, action, group = parts[:5]
+            specs, log, severity, meter = self._split_log_tokens(parts[5:])
             out.append(ParsedRule(name, direction, priority, action, group,
-                                  parts[5:], raw, idx))
+                                  specs, raw, idx, log=log, severity=severity,
+                                  meter=meter))
         return out
+
+    def _split_log_tokens(self, tokens: list[str]) -> tuple[list[str], bool,
+                                                            str, str]:
+        """Pull log/log=SEV/meter=NAME out of the spec list.
+
+        They sit among the specs because that is where a rule's optional
+        trailing words go, but they say nothing about which packets match
+        -- they say what to do when one does. Leaving them in would put
+        'log' into the match string, and build_match would (rightly) warn
+        about an unrecognised token.
+        """
+        specs: list[str] = []
+        log = False
+        severity = ""
+        meter = self.meter_name
+        for tok in tokens:
+            if tok == "log":
+                log = True
+            elif tok.startswith("log="):
+                log = True
+                severity = tok[4:].strip()
+                if severity not in SEVERITIES:
+                    self.ctx.warn(
+                        f"Unknown log severity '{severity}' -- expected one "
+                        f"of {', '.join(SEVERITIES)}. Using "
+                        f"'{self.log_severity}'.")
+                    severity = ""
+            elif tok == "nolog":
+                log = False
+            elif tok.startswith("meter="):
+                meter = tok[6:].strip()
+            else:
+                specs.append(tok)
+        if log and not severity:
+            severity = self.log_severity
+        if not log:
+            meter = ""
+        return specs, log, severity, meter
 
     def acl_rules(self) -> None:
         ctx = self.ctx
@@ -235,8 +439,10 @@ class ACLManager:
 
             match = self.build_match(direction, group, rule.specs)
             ovn.add_acl(ctx, group, direction, priority, match, action,
-                        name=name)
-            ctx.log(f"  {name}: [{priority}] {direction} {action}")
+                        name=name, log=rule.log, severity=rule.severity,
+                        meter=rule.meter)
+            flag = f"  log={rule.severity}" if rule.log else ""
+            ctx.log(f"  {name}: [{priority}] {direction} {action}{flag}")
             ctx.log(f"      {match}")
 
         self.name_existing_rules()
@@ -265,22 +471,35 @@ class ACLManager:
             entry = index.get((rule.direction, str(rule.priority), match))
             if not entry:
                 continue
-            if entry.get("name") == rule.name:
+            wanted = {
+                "name": rule.name,
+                "log": rule.log,
+                "severity": rule.severity if rule.log else "",
+                "meter": rule.meter if rule.log else "",
+            }
+            changes = [k for k, v in wanted.items() if entry.get(k) != v]
+            if not changes:
                 continue
-            # Also clears any log/severity/meter left over from when this
-            # suite set them -- an ACL that still says log=true keeps
-            # ovn-controller emitting records for a feature that has been
-            # removed from the tooling.
-            for column in ("severity", "meter"):
-                ctx.run("ovn-nbctl", "clear", "acl", entry["uuid"], column)
-            if ctx.run("ovn-nbctl", "set", "acl", entry["uuid"],
-                       f"name={rule.name}", "log=false"):
-                fixed += 1
+            argv = ["ovn-nbctl", "set", "acl", entry["uuid"]]
+            for key in changes:
+                value = wanted[key]
+                if key == "log":
+                    argv.append(f"log={'true' if value else 'false'}")
+                elif value:
+                    argv.append(f"{key}={value}")
+                else:
+                    # An empty optional column is CLEARED, not set to "".
+                    # `severity=""` is a schema error, and leaving a stale
+                    # severity on a rule whose logging was turned off is
+                    # how a disabled rule keeps writing records.
+                    ctx.run("ovn-nbctl", "clear", "acl", entry["uuid"], key)
+            if len(argv) > 4 and not ctx.run(*argv):
+                ctx.warn(f"Could not update ACL {entry['uuid']} "
+                         f"({', '.join(changes)}).")
             else:
-                ctx.warn(f"Could not set name '{rule.name}' on ACL "
-                         f"{entry['uuid']}.")
+                fixed += 1
         if fixed:
-            ctx.log(f"Reconciled {fixed} existing ACL(s).")
+            ctx.log(f"Reconciled name/logging on {fixed} existing ACL(s).")
 
     # ------------------------------------------------------------------
     def do_list(self) -> None:
@@ -504,7 +723,11 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     runner = StepRunner(ctx, "acl")
     runner.add("port-groups", "rebuild the port groups from the inventory",
                cmd.port_groups)
+    runner.add("log-meter", "rate-limit meter for logging rules",
+               cmd.log_meter)
     runner.add("rules", "apply the ACL rules", cmd.acl_rules)
+    runner.add("log-sink", "file acl_log records into [acl_log].directory",
+               cmd.log_sink)
 
     if not runner.run(args):
         return 0

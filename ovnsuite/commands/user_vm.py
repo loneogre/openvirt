@@ -334,11 +334,11 @@ class UserVM:
         ovn.add_acl(ctx, self.pg_name, "from-lport", self.drop_priority,
                     f"inport == @{self.pg_name} && ip4 && "
                     f"ip4.dst == {block_set}", "drop",
-                    name="uservm-drop-out")
+                    name="uservm-drop-out", log=True, severity="info")
         ovn.add_acl(ctx, self.pg_name, "to-lport", self.drop_priority,
                     f"outport == @{self.pg_name} && ip4 && "
                     f"ip4.src == {block_set}", "drop",
-                    name="uservm-drop-in")
+                    name="uservm-drop-in", log=True, severity="info")
         ctx.log(f"Isolation ACLs on {self.pg_name} (blocking {len(blocked)} "
                 "range(s), including this segment itself).")
 
@@ -412,7 +412,8 @@ class UserVM:
                 ctx, self.pg_name, "to-lport", self.access_priority,
                 f'outport == "{port_uuid}" && ip4 && '
                 f'ip4.src == {self.mgmt_src} && tcp && tcp.dst == {port}',
-                "allow-related", name=f"{_acl_stem(name)}-{proto}-in")
+                "allow-related", name=f"{_acl_stem(name)}-{proto}-in",
+                log=True, severity="info")
             ctx.log(f"  {proto.upper()} in from {self.mgmt_src} "
                     f"(tcp/{port}) -- allowed.")
         if not access:

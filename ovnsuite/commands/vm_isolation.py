@@ -223,14 +223,16 @@ class VMIsolation:
             ovn.add_acl(ctx, self.pg_name, "from-lport", self.allow_priority,
                         f"inport == @{self.pg_name} && ip4 && "
                         f"ip4.dst == {allow_set}",
-                        "allow-related", name="isolated-allow-out")
+                        "allow-related", name="isolated-allow-out",
+                        log=True, severity="info")
 
             ctx.log("Adding to-lport allow (inbound from external/shadow) at "
                     f"priority {self.allow_priority}...")
             ovn.add_acl(ctx, self.pg_name, "to-lport", self.allow_priority,
                         f"outport == @{self.pg_name} && ip4 && "
                         f"ip4.src == {allow_set}",
-                        "allow-related", name="isolated-allow-in")
+                        "allow-related", name="isolated-allow-in",
+                        log=True, severity="info")
         else:
             ctx.log("No [external_ranges]/[shadow_ranges] declared -- "
                     "no allow tier needed.")
@@ -245,14 +247,14 @@ class VMIsolation:
         ovn.add_acl(ctx, self.pg_name, "from-lport", self.acl_priority,
                     f"inport == @{self.pg_name} && ip4 && "
                     f"ip4.dst == {self.internal_match_set}", "drop",
-                    name="isolated-drop-out")
+                    name="isolated-drop-out", log=True, severity="info")
 
         ctx.log(f"Adding to-lport drop (internal -> member) at priority "
                 f"{self.acl_priority}...")
         ovn.add_acl(ctx, self.pg_name, "to-lport", self.acl_priority,
                     f"outport == @{self.pg_name} && ip4 && "
                     f"ip4.src == {self.internal_match_set}", "drop",
-                    name="isolated-drop-in")
+                    name="isolated-drop-in", log=True, severity="info")
 
         self._name_existing_acls()
 

@@ -51,11 +51,12 @@ def register(subparsers) -> argparse.ArgumentParser:
     p.add_argument("--watch-memory", action="store_true",
                    help="sample ovn-controller's resident memory each second "
                         "while waiting, and print the curve")
-    p.add_argument("--nudge", action="store_true",
-                   help="if a port is still unclaimed halfway through the "
-                        "wait, clear and re-set its iface-id to re-trigger "
-                        "the claim (off by default -- see the note in "
-                        "wait_for_bindings)")
+    p.add_argument("--no-nudge", dest="nudge", action="store_false",
+                   default=True,
+                   help="do not re-assert iface-id on a port that is still "
+                        "unclaimed halfway through the wait (the nudge is on "
+                        "by default and is skipped automatically when "
+                        "ovn-controller's memory looks abnormal)")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
@@ -63,7 +64,7 @@ def register(subparsers) -> argparse.ArgumentParser:
 
 class VMAttach:
     def __init__(self, ctx: Ctx, timeout: int = DEFAULT_TIMEOUT,
-                 watch_memory: bool = False, nudge: bool = False):
+                 watch_memory: bool = False, nudge: bool = True):
         self.ctx = ctx
         # Sampling the curve is how you tell "allocates enormously on the
         # first claim" from "leaks steadily while running" -- two different
@@ -206,17 +207,20 @@ class VMAttach:
             if not pending:
                 break
 
-            # OPT-IN, and off by default.
+            # ON by default, with a guard.
             #
             # Clearing and re-setting iface-id makes ovn-controller RELEASE
-            # the port and then CLAIM it again. That is the right cure for
-            # a missed event -- the SB Port_Binding row not having
-            # propagated when the key first appeared -- but claiming is
-            # also the expensive operation. On a host where compiling a
-            # datapath already costs gigabytes, forcing a second claim
-            # while the first may still be running is the worst available
-            # move. Enable with --nudge when you know the controller is
-            # healthy and a claim was simply missed.
+            # the port and then CLAIM it again -- the right cure for a
+            # missed event, which is what happens when the SB Port_Binding
+            # row had not propagated at the moment the key first appeared.
+            #
+            # It was briefly opt-in, on the theory that claiming was
+            # expensive. It is not: that turned out to be a negated
+            # destination in a router policy, now fixed. What remains is
+            # the `rss` condition below, which skips the nudge if the
+            # controller's memory looks abnormal -- if claiming is ever
+            # expensive again, forcing a second one is the worst available
+            # move, and that guard costs nothing when things are healthy.
             if (self.nudge and not nudged
                     and time.time() > deadline - self.timeout / 2
                     and rss <= ovn.CONTROLLER_RSS_WARN_MB):
@@ -239,9 +243,8 @@ class VMAttach:
             ctx.warn(f"  {vm.name} ({vm.uuid}) tap {tap}")
             self.explain_unbound(vm, tap)
         if not self.nudge:
-            ctx.warn("If the controller is healthy and the claim was simply "
-                     "missed, `ovnctl vm-attach --nudge` re-asserts iface-id "
-                     "to re-trigger it.")
+            ctx.warn("The iface-id nudge was disabled (--no-nudge), so no "
+                     "re-claim was attempted.")
 
     def explain_unbound(self, vm, tap: str) -> None:
         """Say WHICH of the three causes this is.
@@ -453,7 +456,7 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
 
     cmd = VMAttach(ctx, timeout=getattr(args, "timeout", DEFAULT_TIMEOUT),
                    watch_memory=getattr(args, "watch_memory", False),
-                   nudge=getattr(args, "nudge", False))
+                   nudge=getattr(args, "nudge", True))
 
     if args.status:
         cmd.print_status()

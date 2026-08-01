@@ -233,14 +233,21 @@ def acl_index(ctx: Ctx) -> dict[tuple[str, str, str], dict]:
     one, and does it carry the name, logging and meter I meant it to?".
     """
     index: dict[tuple[str, str, str], dict] = {}
-    for row in nb_json(ctx, "_uuid,direction,priority,match,name", "ACL"):
-        if len(row) < 5:
+    cols = "_uuid,direction,priority,match,name,log,severity,meter"
+    for row in nb_json(ctx, cols, "ACL"):
+        if len(row) < 8:
             continue
         uuids = uuid_list(row[0])
         if not uuids:
             continue
         key = (str(row[1] or ""), str(row[2]), str(row[3] or ""))
-        index[key] = {"uuid": uuids[0], "name": _scalar(row[4])}
+        index[key] = {
+            "uuid": uuids[0],
+            "name": _scalar(row[4]),
+            "log": row[5] is True,
+            "severity": _scalar(row[6]),
+            "meter": _scalar(row[7]),
+        }
     return index
 
 
@@ -261,21 +268,35 @@ _acl_name_unsupported = False
 
 
 def add_acl(ctx: Ctx, group: str, direction: str, priority, match: str,
-            action: str, name: str = "") -> None:
-    """`ovn-nbctl acl-add` against a port group, carrying a name.
+            action: str, name: str = "", log: bool = False,
+            severity: str = "", meter: str = "") -> None:
+    """`ovn-nbctl acl-add` against a port group, with its presentation
+    options.
 
     The name is what `ovnctl show` and `ovn-nbctl acl-list` print. Without
     it every rule displays as '-' and the only way to tell two ACLs apart
     is to read their match strings, which is exactly the situation the
     declarative rule names exist to avoid.
 
-    NO LOGGING. Per-ACL logging was removed while investigating
-    ovn-controller memory use -- see the note in ovn-settings.yaml. Adding
-    it back means restoring --log/--severity/--meter here and the
-    [acl_log] handling in the acl command.
+    log/severity/meter turn on ovn-controller's acl_log output for this
+    one ACL. The name matters twice over once logging is on: it is the
+    identifier that appears in every log line, so an unnamed logging ACL
+    produces records nobody can trace back to a rule.
+
+    Note for anyone re-reading the history here: logging was removed for a
+    while on suspicion of causing ovn-controller's memory blow-up. It was
+    not the cause -- a negated destination in a router policy was -- and
+    logging is back. A logged drop does compile differently (see
+    trace_verdict's _DROP_MARKERS) but it is not expensive.
     """
     global _acl_name_unsupported
     head = ["ovn-nbctl", "--may-exist", "--type=port-group"]
+    if log:
+        head.append("--log")
+        if severity:
+            head.append(f"--severity={severity}")
+        if meter:
+            head.append(f"--meter={meter}")
     tail = ["acl-add", group, direction, str(priority), match, action]
 
     if name and not _acl_name_unsupported:
@@ -568,6 +589,24 @@ def sb_table_sizes(ctx: Ctx) -> dict[str, int]:
                        table, timeout=20)
         sizes[table] = len([ln for ln in out.splitlines() if ln.strip()])
     return sizes
+
+
+def lflow_cache_stats(ctx: Ctx) -> str:
+    """ovn-controller's logical-flow cache usage.
+
+    The cache is populated when a datapath's flows are computed, which is
+    exactly what claiming the first VIF on a switch triggers. On OVN
+    releases of the 22.x era it has NO memory limit by default --
+    external-ids:ovn-memlimit-lflow-cache-kb is unset -- so it can grow
+    until the host runs out.
+
+    Read-only, and it may well time out on a controller that is already in
+    trouble; that is itself worth reporting rather than hiding.
+    """
+    res = appctl(ctx, "lflow-cache/show-stats")
+    if res.ok and res.stdout.strip():
+        return res.stdout.strip()
+    return ""
 
 
 def controller_log_tail(ctx: Ctx, match: str = "", lines: int = 20) -> str:
