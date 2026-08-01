@@ -36,6 +36,7 @@ MODULES = (
     "acl",
     "vm_attach",
     "pcap",
+    "reconcile",
     "diagnose",
     "show",
     "runbook",

@@ -156,6 +156,11 @@ def _uuid_list(value) -> list[str]:
     return []
 
 
+#: Public alias -- other modules need to turn an ovsdb reference column
+#: into row ids without reaching for a private name.
+uuid_list = _uuid_list
+
+
 def pg_snapshot(ctx: Ctx) -> dict[str, PortGroup]:
     """Every port group in the NB db, members and ACLs resolved.
 
@@ -302,13 +307,50 @@ def chassis_names(ctx: Ctx) -> list[str]:
 
 
 def first_chassis(ctx: Ctx) -> str:
+    """The first registered chassis name.
+
+    DO NOT use this to decide what to pin a gateway port to. On a host that
+    has drifted there may be a stale row and the 'first' one is whichever
+    the db happens to return -- pinning to it is how a pin ends up
+    referencing a chassis that no longer exists. Use
+    identity.pin_target() instead; this stays for read-only reporting.
+    """
     names = chassis_names(ctx)
     return names[0] if names else ""
+
+
+def chassis_uuid_names(ctx: Ctx) -> dict[str, str]:
+    """Chassis row uuid -> chassis name.
+
+    Port_Binding.chassis is a row reference, not a name, so any check that
+    wants to know WHICH chassis a port is bound to has to resolve it.
+    """
+    out: dict[str, str] = {}
+    for row in sb_json(ctx, "_uuid,name", "Chassis"):
+        if len(row) < 2:
+            continue
+        uuids = _uuid_list(row[0])
+        if uuids:
+            out[uuids[0]] = str(row[1] or "")
+    return out
 
 
 def port_binding_chassis(ctx: Ctx, logical_port: str) -> str:
     return ctx.qout("ovn-sbctl", "--bare", "--columns=chassis", "find",
                     "Port_Binding", f"logical_port={logical_port}").strip()
+
+
+def port_binding_chassis_name(ctx: Ctx, logical_port: str) -> str:
+    """The NAME of the chassis a port is bound to ('' if unbound).
+
+    A binding row survives a reboot, so 'has a chassis' is not the same
+    question as 'is bound to the chassis this host is currently running
+    as'. Only the name can tell those apart.
+    """
+    uuid = port_binding_chassis(ctx, logical_port)
+    if not uuid or uuid == "[]":
+        return ""
+    return chassis_uuid_names(ctx).get(uuid, uuid[:12])
 
 
 def port_binding_type(ctx: Ctx, logical_port: str) -> str:

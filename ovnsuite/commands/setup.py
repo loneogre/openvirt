@@ -13,10 +13,9 @@ Sets up a single-node OVN environment:
 from __future__ import annotations
 
 import argparse
-import socket
 import time
 
-from .. import ovn
+from .. import identity, ovn
 from ..context import Abort, Ctx
 from ..state import SETUP, record
 from ..steps import StepRunner, add_step_args
@@ -30,6 +29,7 @@ REQUIRED_CFG = (
     "setup:lrp_host", "setup:lrp_host_cidr", "setup:lrp_host_mac",
     "setup:lrp_int", "setup:lrp_int_cidr", "setup:lrp_int_mac",
     "setup:ovn_encap_ip", "setup:ovn_encap_type", "setup:ovn_remote",
+    "setup:system_id",
     "topology:br_int", "topology:host_if", "topology:lr_core",
     "topology:ls_ext", "topology:ls_host", "topology:ls_int",
 )
@@ -48,14 +48,22 @@ class Setup:
         self.ctx = ctx
         c = ctx.config
 
+        # Set by external_ids() when it had to rewrite system-id, so later
+        # steps (and `ovnctl reconcile`) know the chassis has just been
+        # re-registered under a different name.
+        self.identity_changed = False
+
         self.ovn_remote = c.cfg("setup", "ovn_remote")
         self.encap_type = c.cfg("setup", "ovn_encap_type")
         self.encap_ip = c.cfg("setup", "ovn_encap_ip")
 
-        # A fixed system_id in the yaml is strongly preferred: it prevents
-        # chassis identity drift across reboots. An empty value falls back
-        # to the hostname, which is exactly what causes that drift.
-        self.system_id = c.cfg_opt("setup", "system_id", "") or socket.gethostname()
+        # REQUIRED, and deliberately so. There used to be a fallback to
+        # socket.gethostname() here; a hostname that changes between boots
+        # (localhost vs localhost.localdomain, a DHCP-supplied name, a
+        # rename) renames the chassis, and every Port_Binding and gateway
+        # pin then references an identity nothing is running under.
+        # identity.configured() aborts with instructions if it is unset.
+        self.system_id = identity.configured(ctx)
 
         self.ls_int = c.cfg("topology", "ls_int")
         self.ls_ext = c.cfg("topology", "ls_ext")
@@ -91,24 +99,45 @@ class Setup:
 
     # -- 1 ---------------------------------------------------------------
     def external_ids(self) -> None:
+        """Reconcile external-ids -- every key, every run.
+
+        This step used to return early if ovn-remote was already present.
+        conf.db is persistent, so from the second deploy onwards that gate
+        was always true and system-id was never re-asserted again, while
+        `ovs-ctl start --system-id=random` rewrote it at every boot. The
+        deployment then looked healthy and bound nothing.
+        """
         ctx = self.ctx
         ctx.dr_head("OVS external-ids")
-        ctx.log("Checking OVS external-ids for ovn-remote...")
+        ctx.log("Reconciling OVS external-ids...")
 
-        # `ovs-vsctl get open . external_ids` is NEVER literally "{}" -- OVS
-        # always populates hostname/rundir. So check for the ovn-remote key
-        # specifically, not whether the whole map is empty.
-        if ovn.has_external_id(ctx, "ovn-remote"):
-            ctx.log(f"ovn-remote already set ({ovn.external_id(ctx, 'ovn-remote')}), skipping.")
+        id_changed = identity.assert_external_ids(
+            ctx, self.system_id, self.ovn_remote, self.encap_type,
+            self.encap_ip)
+
+        if not id_changed:
             return
 
-        ctx.log("ovn-remote not set, configuring for single-node (remote = localhost)...")
-        ctx.run("ovs-vsctl", "set", "open", ".",
-                f"external-ids:ovn-remote={self.ovn_remote}",
-                f"external-ids:ovn-encap-type={self.encap_type}",
-                f"external-ids:ovn-encap-ip={self.encap_ip}",
-                f"external-ids:system-id={self.system_id}")
-        ctx.log("external-ids configured.")
+        # ovn-controller reads system-id once, at startup. If it is already
+        # running it is still registered under the OLD name, so leaving it
+        # alone would leave the host with a chassis nothing matches.
+        self.identity_changed = True
+        if ctx.q("pgrep", "-x", "ovn-controller").ok or ctx.dry_run:
+            ctx.warn("system-id changed while ovn-controller was running -- "
+                     "restarting it so it re-registers.")
+            identity.restart_controller(ctx, "system-id changed")
+            if not identity.wait_for_chassis(ctx, self.system_id):
+                ctx.warn(f"ovn-controller has not registered as "
+                         f"'{self.system_id}' yet -- later steps that need a "
+                         "chassis may fail; re-run if so.")
+
+        leftovers = identity.stale(ctx, self.system_id)
+        if leftovers:
+            ctx.warn(f"Chassis row(s) under the previous identity remain: "
+                     f"{', '.join(leftovers)}")
+            ctx.warn("Port bindings and gateway pins referencing them will "
+                     "never bind.")
+            ctx.warn("Clear them with: ovnctl reconcile --repair-identity")
 
     # -- 1b --------------------------------------------------------------
     def ovn_controller(self) -> None:

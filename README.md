@@ -12,6 +12,7 @@ sudo ./ovnctl -n deploy           # preview it, change nothing
 sudo ./ovnctl setup --list-steps  # what one command actually does
 sudo ./ovnctl setup --only host-interface
 sudo ./ovnctl diagnose
+sudo ./ovnctl reconcile           # after a reboot: reapply runtime state
 ```
 
 ---
@@ -38,6 +39,38 @@ ovnsuite/
   paths.py                  split-vs-flat layout resolution
   commands/                 one module per original script
 ```
+
+---
+
+## Surviving a reboot
+
+The OVN databases are persistent; the runtime half of a deployment is
+not. After a reboot three things are gone and nothing puts them back:
+
+* `external-ids:system-id` — `ovs-ctl start --system-id=random` rewrites
+  it at every boot from `/etc/openvswitch/system-id.conf`, so the chassis
+  is renamed and every `Port_Binding.chassis` and gateway pin quietly
+  stops matching. Set a fixed `[setup].system_id`; `setup` and
+  `reconcile` write it to both places.
+* host-if's link state, address and routes — kernel state on an OVS
+  internal port, lost every time.
+* ovn-controller's claim on any tap recreated after it started.
+
+`ovnctl reconcile` reapplies all of it and is safe to re-run:
+
+```
+sudo ./ovnctl reconcile                    # reassert, report anything unsafe
+sudo ./ovnctl reconcile --repair-identity  # also delete stale chassis rows
+sudo ./ovnctl reconcile --install-unit     # run it at every boot
+```
+
+`--install-unit` writes `/etc/systemd/system/ovn-reconcile.service`,
+ordered after `ovn-controller.service`, and enables it.
+
+Note that `Port_Binding.chassis` survives a reboot too, so a binding can
+name a chassis nothing is running under. `diagnose` resolves the chassis
+*name* rather than just checking one is set, which is the difference
+between a live binding and a fossil.
 
 Both layouts the shell suite supported still work: `configs/` + `state/`
 beside the executable, or everything flat in one directory. Overrides:

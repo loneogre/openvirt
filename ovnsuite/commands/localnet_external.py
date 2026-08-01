@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import argparse
 
-from .. import netcalc, ovn, paths
+from .. import identity, netcalc, ovn, paths
 from ..config import load_legacy_ranges
 from ..context import Abort, Ctx
 from ..state import LOCALNET_EXTERNAL, Tracker, record
@@ -358,17 +358,12 @@ class LocalnetExternal:
         ctx.run("ovn-nbctl", "lsp-set-addresses", peer, "router")
         ctx.run("ovn-nbctl", "lsp-set-options", peer, f"router-port={self.lrp_asa}")
 
-        chassis = ovn.first_chassis(ctx)
-        if not chassis:
-            if ctx.dry_run:
-                ctx.warn("No chassis registered (dry-run: using <CHASSIS> placeholder).")
-                chassis = "<CHASSIS>"
-            else:
-                raise Abort("No chassis found in the Southbound db. "
-                            "Is ovn-controller running/connected?")
+        # Same rule as the internal uplink: pin to the CONFIGURED identity,
+        # never to "whatever chassis the SB db lists first". See
+        # identity.pin_target().
+        chassis = identity.pin_target(ctx)
         ctx.log(f"Using chassis: {chassis}")
-        ctx.run("ovn-nbctl", "lrp-set-gateway-chassis", self.lrp_asa, chassis,
-                self.gw_priority)
+        identity.repin_gateway(ctx, self.lrp_asa, chassis, self.gw_priority)
 
     # ------------------------------------------------------------------
     # the policy tiers

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import argparse
 
-from .. import ovn
+from .. import identity, ovn
 from ..context import Abort, Ctx
 from ..state import LOCALNET_INTERNAL, Tracker, record
 from ..steps import StepRunner, add_step_args
@@ -183,19 +183,16 @@ class LocalnetInternal:
 
         ctx.log(f"Pinning {self.lrp_uplink} to a gateway chassis "
                 "(required even with a single chassis)...")
-        chassis = ovn.first_chassis(ctx)
-        if not chassis:
-            if ctx.dry_run:
-                ctx.warn("No chassis registered (dry-run: using <CHASSIS> placeholder).")
-                chassis = "<CHASSIS>"
-            else:
-                raise Abort(
-                    "No chassis found in the Southbound db. Is ovn-controller "
-                    "running/connected?\nRun `ovnctl diagnose` to check, then re-run."
-                )
+
+        # NOT ovn.first_chassis(). On a host whose identity has drifted the
+        # SB db can hold a stale row, and "the first chassis" is whichever
+        # one the db returns first -- pinning to that is precisely how a
+        # pin ends up naming a chassis nothing runs under. pin_target()
+        # returns the configured identity and refuses if it is not actually
+        # registered.
+        chassis = identity.pin_target(ctx)
         ctx.log(f"Using chassis: {chassis}")
-        ctx.run("ovn-nbctl", "lrp-set-gateway-chassis", self.lrp_uplink,
-                chassis, self.gw_priority)
+        identity.repin_gateway(ctx, self.lrp_uplink, chassis, self.gw_priority)
 
     # -- 5 ---------------------------------------------------------------
     def routes(self) -> None:

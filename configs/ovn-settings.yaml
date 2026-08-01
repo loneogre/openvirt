@@ -37,10 +37,19 @@ setup:
   ovn_remote: unix:/var/run/ovn/ovnsb_db.sock
   ovn_encap_type: geneve
   ovn_encap_ip: 127.0.0.1
-  # system_id: STRONGLY recommend a fixed string here (e.g. ovn-host).
-  # Empty = fall back to $(hostname), which is what causes chassis
-  # identity drift across reboots when the hostname changes.
-  system_id: ""
+  # system_id: REQUIRED, and it must be a fixed string that will never
+  # change for the life of this host. It is the chassis identity: the
+  # Chassis row in the SB db, every Port_Binding.chassis reference and
+  # every gateway pin are keyed off it. Change it and all of those keep
+  # existing while matching nothing.
+  #
+  # There is no fallback. Falling back to $(hostname) is what produced
+  # the "localhost vs localhost.localdomain across a reboot" outage.
+  # `ovnctl setup` and `ovnctl reconcile` also write this value to
+  # /etc/openvswitch/system-id.conf, because ovs-ctl reads that file at
+  # every boot and overwrites external-ids:system-id from it -- setting
+  # only external-ids fixes the running system and nothing else.
+  system_id: ovn-host
 
   lrp_int: lrp-int-vm
   lrp_int_mac: 00:00:00:00:01:01

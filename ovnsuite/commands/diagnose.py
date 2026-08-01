@@ -28,7 +28,7 @@ from __future__ import annotations
 import argparse
 import re
 
-from .. import netcalc, ovn
+from .. import identity, netcalc, ovn
 from ..context import Colour, Ctx
 from ..inventory import Inventory
 from ..state import (ACLS, LOCALNET_EXTERNAL, LOCALNET_INTERNAL, SETUP,
@@ -64,6 +64,7 @@ class Diagnose:
         self.ls_ext = c.cfg_opt("topology", "ls_ext", "ls-ext-vm")
         self.lrp_int = c.cfg_opt("diagnose", "lrp_int", "lrp-int-vm")
         self.gateway = c.cfg_opt("diagnose", "gateway", "172.31.1.10")
+        self.host_ip = c.cfg_opt("setup", "host_if_ip", "")
         self.pg_name = c.cfg_opt("vm_isolation", "pg_name", "pg_isolated")
         self.pg_expected = c.cfg_int_opt("diagnose", "pg_expected_members", 4)
 
@@ -97,6 +98,19 @@ class Diagnose:
         self.warn_count = 0
         self.current_section = ""
         self.failed_sections: list[str] = []
+
+        # Set by section 4. Later sections use it to decide whether
+        # "restart ovn-controller" is sound advice or a way to make things
+        # considerably worse -- with a drifted system-id a restart
+        # registers a SECOND chassis and unbinds the gateway.
+        self.identity_ok = True
+        # Set by section 0 when the tracker predates the current boot.
+        self.boot_stale = False
+        # Set by section 7 so section 8 can name the cause instead of
+        # reporting a second, derivative failure.
+        self.host_if_down = False
+        # The canonical name from the settings file, '' if unset.
+        self.canonical_id = identity.configured_opt(ctx)
 
     # ------------------------------------------------------------------
     # reporting
@@ -176,6 +190,23 @@ class Diagnose:
         if f[VM_ISOLATION] and not f[VM_CONFIG]:
             self.note("Tracker inconsistency: vm-isolation recorded without vm-config.")
 
+        # The tracker records INTENT and lives on disk, so it survives a
+        # reboot untouched. Without this check a post-reboot run reads
+        # "setup=True", gates away the sections that would have found the
+        # problem, and reports a deployment that is no longer realised.
+        earlier = self.tracker.any_from_earlier_boot()
+        if earlier:
+            self.boot_stale = True
+            self.note("Every recorded component below was deployed during an "
+                      "EARLIER boot:")
+            self.detail(*[f"  {k}" for k in earlier])
+            self.detail(
+                "The OVN databases persist, but the runtime half does not:",
+                "host-if's link/address/routes, ovn-controller's claim on each",
+                "tap, and external-ids:system-id (which ovs-ctl rewrites at",
+                "every boot) are all reapplied by nothing.",
+                "-> ovnctl reconcile")
+
     # ------------------------------------------------------------------
     # 1
     # ------------------------------------------------------------------
@@ -253,7 +284,42 @@ class Diagnose:
             return
 
         names = ovn.chassis_names(ctx)
-        local_id = ovn.external_id(ctx, "system-id")
+        local_id = identity.local(ctx)
+        conf_id = identity.conf_file_value()
+
+        # Three names have to agree, and each drifts for its own reason:
+        #   settings file   what the operator declared
+        #   external-ids    what ovn-controller registers as, rewritten at
+        #                   every boot by ovs-ctl from system-id.conf
+        #   system-id.conf  what ovs-ctl will assert at the NEXT boot
+        # Reporting only the first two hides the reason the drift keeps
+        # coming back after being fixed by hand.
+        self.detail(f"configured (settings) : {self.canonical_id or '<unset>'}",
+                    f"external-ids:system-id: {local_id or '<unset>'}",
+                    f"{identity.SYSTEM_ID_CONF}: {conf_id or '<absent>'}")
+
+        if not self.canonical_id:
+            self.bad("[setup].system_id is empty in the settings file.")
+            self.identity_ok = False
+            self.detail(
+                "Nothing pins the chassis name, so it is whatever ovs-ctl or",
+                "the hostname supplied at the last boot. Set a fixed value",
+                "(e.g. ovn-host) and run: ovnctl reconcile --repair-identity")
+        elif conf_id and conf_id != self.canonical_id:
+            self.bad(f"{identity.SYSTEM_ID_CONF} says '{conf_id}', not "
+                     f"'{self.canonical_id}'.")
+            self.identity_ok = False
+            self.detail(
+                "ovs-ctl reads that file at every boot and writes it into",
+                "external-ids:system-id, so any fix applied only to",
+                "external-ids is undone by the next reboot.",
+                "-> ovnctl reconcile")
+        elif not conf_id:
+            self.note(f"{identity.SYSTEM_ID_CONF} does not exist.")
+            self.detail(
+                "ovs-ctl will generate a random UUID there at the next boot",
+                "and overwrite external-ids:system-id with it.",
+                "-> ovnctl reconcile")
 
         if not names:
             self.bad("No Chassis registered in the Southbound db.")
@@ -267,15 +333,15 @@ class Diagnose:
         if len(names) > 1:
             self.bad(f"MULTIPLE chassis registered ({len(names)}) on a "
                      "single-node deployment:")
+            self.identity_ok = False
             self.block("\n".join(names))
             self.detail(
                 "This is the classic system-id drift problem (e.g. hostname vs",
                 "FQDN changing across reboots). Gateway ports pinned to the OLD",
                 f"name will never bind. Local system-id right now: {local_id or '<unset>'}",
-                "Fix: pick ONE canonical name, set it in",
-                "/etc/openvswitch/system-id.conf AND external-ids:system-id,",
-                "delete the stale chassis (ovn-sbctl chassis-del <old>), and",
-                "re-pin gateway ports (ovn-nbctl lrp-set-gateway-chassis ...).")
+                "Fix: ovnctl reconcile --repair-identity",
+                "(sets one canonical name in the settings file, external-ids AND",
+                "system-id.conf, deletes the stale rows and re-points the pins).")
             return
 
         self.ok(f"Exactly one chassis is registered: {names[0]}")
@@ -285,6 +351,7 @@ class Diagnose:
         if not ctx.q("pgrep", "-x", "ovn-controller").ok:
             self.bad("But NO ovn-controller process is running -- this is a GHOST "
                      "chassis")
+            self.identity_ok = False
             self.detail(
                 "row left behind by a previous controller. Port bindings will",
                 "exist but never bind (cr-lrp-* unbound, VIFs DOWN).",
@@ -306,8 +373,26 @@ class Diagnose:
         if local_id and names[0] != local_id:
             self.bad(f"But local external-ids:system-id ({local_id}) does NOT "
                      "match it.")
-            self.detail("ovn-controller may be about to register a second chassis, or",
-                        "the registered one is stale from a previous identity.")
+            self.identity_ok = False
+            self.detail(
+                f"The registered chassis '{names[0]}' is a leftover identity.",
+                "Nothing is running under it, so every Port_Binding.chassis and",
+                "gateway pin that names it is stale -- and those columns are",
+                "PERSISTENT, which is why ports elsewhere in this report can",
+                "still look 'bound' while nothing actually forwards.",
+                "",
+                "Do NOT just restart ovn-controller. It would register a SECOND",
+                "chassis under the current id, leaving the gateway pinned to the",
+                "old one and taking the uplink down as well.",
+                "-> ovnctl reconcile --repair-identity")
+        elif self.canonical_id and names[0] != self.canonical_id:
+            self.bad(f"Registered chassis '{names[0]}' is not the configured "
+                     f"identity '{self.canonical_id}'.")
+            self.identity_ok = False
+            self.detail("external-ids agrees with the registered name, so the",
+                        "controller is consistent -- but both disagree with the",
+                        "settings file, and the next reconcile will rename it.",
+                        "-> ovnctl reconcile --repair-identity")
         else:
             self.ok("Chassis name matches local external-ids:system-id.")
 
@@ -333,11 +418,26 @@ class Diagnose:
                         "NB to SB.")
             return
 
-        chassis = ovn.port_binding_chassis(ctx, self.host_if)
-        if not chassis or chassis == "[]":
+        # "Has a chassis" is not the question. Port_Binding.chassis is a
+        # persistent column: a binding made before a reboot is still there
+        # afterwards, pointing at whatever chassis claimed it then. Only
+        # resolving the NAME and comparing it to the identity this host is
+        # currently running under tells a live binding from a fossil.
+        bound_to = ovn.port_binding_chassis_name(ctx, self.host_if)
+        local_id = identity.local(ctx)
+        if not bound_to:
             self.bad(f"{self.host_if} has no chassis bound -- it's not 'up'.")
+        elif local_id and bound_to != local_id:
+            self.bad(f"{self.host_if} is bound to chassis '{bound_to}', but this "
+                     f"host runs as '{local_id}'.")
+            self.detail(
+                "This is a STALE binding, not a working one -- it was written by",
+                "a controller running under the old identity and simply never",
+                "cleaned up. Nothing is forwarding for this port.",
+                "-> see section 4, then: ovnctl reconcile --repair-identity")
         else:
-            self.ok(f"{self.host_if} port binding exists and has a chassis bound.")
+            self.ok(f"{self.host_if} is bound to the local chassis "
+                    f"({bound_to}).")
         for line in pb.splitlines():
             if re.search(r"chassis|logical_port|mac", line):
                 print(f"        {line}")
@@ -383,8 +483,13 @@ class Diagnose:
                    "chassisredirect"}
         total = bound = skipped = problems = 0
         off_vifs: list[str] = []
+        stale_bound: list[tuple[str, str]] = []
         # Fetched on first use: a fully bound host never needs it.
         taps: dict[str, str] | None = None
+        # Resolved once for the whole sweep -- a bound port is only really
+        # bound if it is bound to THIS chassis.
+        chassis_names = ovn.chassis_uuid_names(ctx)
+        local_id = identity.local(ctx)
 
         for row in rows:
             if len(row) < 3:
@@ -396,7 +501,12 @@ class Diagnose:
                 skipped += 1
                 continue
             if ovn.ref_is_set(row[2]):
-                bound += 1
+                refs = ovn.uuid_list(row[2])
+                owner = chassis_names.get(refs[0], "") if refs else ""
+                if local_id and owner and owner != local_id:
+                    stale_bound.append((lp, owner))
+                else:
+                    bound += 1
                 continue
             # Unbound VIF -- is a local OVS interface carrying this iface-id?
             if taps is None:
@@ -405,9 +515,25 @@ class Diagnose:
             if tap:
                 self.bad(f"VIF '{lp}' is plugged into local OVS (interface: {tap}) "
                          "but has NO chassis bound.")
-                self.detail("The tap exists but ovn-controller never claimed the port.",
-                            "This is the reboot-race signature. "
-                            "Try: systemctl restart ovn-controller")
+                # The fix depends entirely on section 4. Restarting the
+                # controller is the right move for a plain reboot race and
+                # the wrong one when the identity has drifted, where it
+                # registers a second chassis and unbinds the gateway too.
+                if self.identity_ok:
+                    self.detail(
+                        "The tap exists but ovn-controller never claimed the port.",
+                        "This is the reboot-race signature.",
+                        "-> ovnctl reconcile   (or: systemctl restart ovn-controller)")
+                else:
+                    self.detail(
+                        "The tap exists but ovn-controller never claimed the port.",
+                        "Section 4 failed, so this is a symptom of the identity",
+                        "problem, not a separate race -- the controller is not",
+                        "claiming anything under the name the bindings expect.",
+                        "Do NOT restart ovn-controller before fixing that; a",
+                        "restart would register a second chassis and unbind the",
+                        "gateway as well.",
+                        "-> ovnctl reconcile --repair-identity")
                 problems += 1
             else:
                 off_vifs.append(lp)
@@ -419,9 +545,22 @@ class Diagnose:
             for v in off_vifs:
                 self.detail(v)
 
+        if stale_bound:
+            self.bad(f"{len(stale_bound)} port(s) bound to a chassis this host "
+                     f"is not running as ('{local_id}'):")
+            for lp, owner in stale_bound:
+                self.detail(f"{lp} -> {owner}")
+            self.detail(
+                "Port_Binding.chassis persists across reboots, so these rows",
+                "outlived the controller that wrote them. They read as 'up' in",
+                "any check that only asks whether a chassis is set, and they",
+                "forward nothing.",
+                "-> ovnctl reconcile --repair-identity")
+
         self.ok(f"Swept {total} port bindings: {bound} bound, {skipped} non-VIF "
-                f"skipped, {len(off_vifs)} powered-off VIF(s), {problems} problem(s).")
-        if problems == 0:
+                f"skipped, {len(off_vifs)} powered-off VIF(s), "
+                f"{len(stale_bound)} stale-bound, {problems} problem(s).")
+        if problems == 0 and not stale_bound:
             self.ok("No running-but-unbound VIFs detected.")
 
     # ------------------------------------------------------------------
@@ -465,8 +604,19 @@ class Diagnose:
                           "to exist.")
             return
 
+        local_id = identity.local(ctx)
+        chassis_names = ovn.chassis_uuid_names(ctx)
         for lp, chassis in rows:
             if chassis and chassis != "[]":
+                owner = chassis_names.get(chassis, "")
+                if local_id and owner and owner != local_id:
+                    self.bad(f"{lp} is bound to '{owner}', but this host runs as "
+                             f"'{local_id}' -- a stale binding, not a live one.")
+                    self.detail(
+                        "The gateway path is DOWN despite the binding row: no",
+                        "running controller owns that chassis name.",
+                        "-> ovnctl reconcile --repair-identity")
+                    continue
                 self.ok(f"{lp} is bound to a chassis.")
             else:
                 self.bad(f"{lp} has NO chassis bound -- the gateway path through "
@@ -519,6 +669,18 @@ class Diagnose:
         registered = set(ovn.chassis_names(ctx))
         for pin_name, pin_chassis in pins:
             if pin_chassis in registered:
+                # Registered is necessary, not sufficient. A pin naming a
+                # stale-but-still-present chassis passes every check right
+                # up until that row is cleaned up, at which point the
+                # uplink drops for no apparent reason.
+                if self.canonical_id and pin_chassis != self.canonical_id:
+                    self.note(f"Pin '{pin_name}' -> '{pin_chassis}' is registered, "
+                              f"but the configured identity is "
+                              f"'{self.canonical_id}'.")
+                    self.detail(
+                        "The pin works only for as long as that stale chassis row",
+                        "survives. Re-point it: ovnctl reconcile")
+                    continue
                 self.ok(f"Pin '{pin_name}' -> chassis '{pin_chassis}' (registered).")
             else:
                 self.bad(f"Pin '{pin_name}' references chassis '{pin_chassis}', "
@@ -897,6 +1059,30 @@ class Diagnose:
             self.bad(f"iface-id is '{iface_id}', expected '{self.host_if}'.")
         self.detail(f"admin_state={admin} link_state={link}")
 
+        # An internal port on br-int comes back after a reboot with the
+        # port and its iface-id intact and the kernel side blank: down, no
+        # address, no routes. Nothing in the OVN databases records that,
+        # and the tracker says setup already ran, so this is where a
+        # rebooted host quietly stops answering.
+        if admin == "down":
+            self.bad(f"{self.host_if} is administratively DOWN.")
+            self.host_if_down = True
+            self.detail(
+                "The OVS port and its iface-id survive a reboot; `ip link set",
+                "up`, the address and the routes do not, and nothing reapplies",
+                "them. Everything routed through this interface is unreachable",
+                "from the host until they are.",
+                "-> ovnctl reconcile     (or: ovnctl setup --only host-interface)")
+            return
+
+        addrs = ctx.qout("ip", "-4", "-o", "addr", "show", "dev", self.host_if)
+        if self.host_ip and self.host_ip not in addrs:
+            self.bad(f"{self.host_if} is up but has no {self.host_ip} address.")
+            self.host_if_down = True
+            self.detail("Addresses and routes on an OVS internal port are kernel",
+                        "state and are lost at every reboot.",
+                        "-> ovnctl reconcile")
+
     # ------------------------------------------------------------------
     # 8
     # ------------------------------------------------------------------
@@ -925,6 +1111,19 @@ class Diagnose:
         else:
             self.bad(f"No response from {self.gateway}.")
             self.block(output)
+            # Almost never a routing problem in its own right -- name the
+            # section that actually explains it rather than leaving the
+            # operator to correlate two failures by eye.
+            if self.host_if_down:
+                self.detail(
+                    f"Section 7 found {self.host_if} down or unaddressed, which",
+                    "is sufficient on its own to explain this. Fix that first.",
+                    "-> ovnctl reconcile")
+            elif not self.identity_ok:
+                self.detail(
+                    "Section 4 found the chassis identity inconsistent. With no",
+                    "live claim on the port there is nothing to answer an ARP.",
+                    "-> ovnctl reconcile --repair-identity")
 
     # ------------------------------------------------------------------
     def summary(self) -> None:
@@ -943,6 +1142,16 @@ class Diagnose:
             print("Tracker gating was ACTIVE -- [SKIP] sections were not counted.")
         else:
             print("No tracker file -- all sections ran unconditionally.")
+
+        # One line naming the command that addresses the whole class of
+        # failure, rather than leaving three sections each pointing at a
+        # different fragment of the same fix.
+        if not self.identity_ok:
+            print("Chassis identity is inconsistent -- start with: "
+                  "ovnctl reconcile --repair-identity")
+        elif self.host_if_down or self.boot_stale:
+            print("Runtime state from before the last reboot was not "
+                  "reapplied -- start with: ovnctl reconcile")
         print("")
 
 
