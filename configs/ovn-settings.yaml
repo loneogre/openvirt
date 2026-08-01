@@ -593,6 +593,14 @@ user_vms:
   lrp_mac: 00:00:00:00:01:04
   pg_name: pg_user_vms
   management_source: 172.31.0.0/27
+  # Which inbound protocols a slot MAY be given, and on which port. The
+  # protocol is chosen per slot at creation time (--ssh / --rdp / --http /
+  # --https); these keys only change the port each one means, for a
+  # segment whose services do not sit on the well-known numbers.
+  port_ssh: 22
+  port_rdp: 3389
+  port_http: 80
+  port_https: 443
   # access_priority MUST exceed drop_priority -- the management rules are
   # exceptions to the isolation drops. The command refuses to run if this
   # is inverted, because the failure mode is ten silently unreachable VMs.

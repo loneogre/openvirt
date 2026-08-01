@@ -14,13 +14,15 @@ The policy for every slot is identical and is NOT negotiable per VM:
     against the whole segment rather than against "internal".
   * to or from our internal networks -- DENIED.
   * INBOUND management -- allowed from the management source only, on the
-    protocols chosen at creation time (--ssh, --rdp, or both).
+    protocols chosen at creation time: --ssh, --rdp, --http, --https, in
+    any combination.
 
 Only the inbound protocols are per VM, because that is the only choice
 that does not weaken anyone else's isolation.
 
     ovnctl user-vm --create --ssh              take the next free slot
-    ovnctl user-vm --create --rdp --ssh        both
+    ovnctl user-vm --create --ssh --rdp        more than one
+    ovnctl user-vm --create --http --https     a web box
     ovnctl user-vm --list                      what is allocated
     ovnctl user-vm --show user-vm3             reprint its virsh XML
     ovnctl user-vm --delete user-vm3           free the slot
@@ -61,9 +63,14 @@ STATE_NAME = "user-vms.json"
 #: look like a hardware NIC in captures, which is misleading.
 MAC_PREFIX = "52:54:00"
 
+#: Inbound protocols a slot may be given, and their default TCP ports.
+#: Adding one here is all it takes -- the CLI switch, the per-slot ACL, the
+#: `--list` column and the teardown are all generated from this.
 ACCESS_PORTS = {
-    "ssh": ("tcp", "22"),
-    "rdp": ("tcp", "3389"),
+    "ssh": "22",
+    "rdp": "3389",
+    "http": "80",
+    "https": "443",
 }
 
 VIRSH_XML = """\
@@ -94,10 +101,12 @@ def register(subparsers) -> argparse.ArgumentParser:
                       help="rebuild every allocated slot in OVN "
                            "(after delete --purge-db)")
 
-    p.add_argument("--ssh", action="store_true",
-                   help="permit inbound SSH (tcp/22) from the management source")
-    p.add_argument("--rdp", action="store_true",
-                   help="permit inbound RDP (tcp/3389) from the management source")
+    # Generated from ACCESS_PORTS so the switches and the rules they
+    # create cannot drift apart.
+    for proto, port in ACCESS_PORTS.items():
+        p.add_argument(f"--{proto}", action="store_true",
+                       help=f"permit inbound {proto.upper()} (tcp/{port} by "
+                            f"default) from the management source")
     p.add_argument("--label", metavar="TEXT", default="",
                    help="free-text note recorded against the slot "
                         "(whose VM it is, what it is for)")
@@ -189,6 +198,14 @@ class UserVM:
                                   "172.31.0.0/27")
         self.drop_priority = c.cfg_opt("user_vms", "drop_priority", "1000")
         self.access_priority = c.cfg_opt("user_vms", "access_priority", "1100")
+
+        # Per-protocol port overrides, e.g. [user_vms].port_http: 8080 for
+        # a segment whose web services do not sit on 80. Defaults are the
+        # well-known ports.
+        self.ports = {
+            proto: c.cfg_opt("user_vms", f"port_{proto}", default)
+            for proto, default in ACCESS_PORTS.items()
+        }
 
         if int(self.access_priority) <= int(self.drop_priority):
             raise Abort(
@@ -416,7 +433,7 @@ class UserVM:
         """
         ctx = self.ctx
         for proto in access:
-            _, port = ACCESS_PORTS[proto]
+            port = self.ports[proto]
             ovn.add_acl(
                 ctx, self.pg_name, "to-lport", self.access_priority,
                 f'outport == "{port_uuid}" && ip4 && '
@@ -578,8 +595,9 @@ class UserVM:
         print(f"  Gateway      {self.gateway}")
         print(f"  MAC          {record['mac']}")
         print(f"  OVN port     {record['uuid']}")
-        print(f"  Reachable    {', '.join(a.upper() for a in access) or 'NOTHING'}"
-              f" from {self.mgmt_src}")
+        reach = ", ".join(f"{a.upper()}/{self.ports[a]}" for a in access
+                          if a in self.ports)
+        print(f"  Reachable    {reach or 'NOTHING'} from {self.mgmt_src}")
         print("")
         print(f"1. virsh edit <your-domain>  and add inside <devices>:")
         print("")
@@ -634,11 +652,12 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     if args.reapply:
         return cmd.reapply()
     if args.create:
-        access = [p for p, on in (("ssh", args.ssh), ("rdp", args.rdp)) if on]
+        access = [p for p in ACCESS_PORTS if getattr(args, p, False)]
         if not access:
+            flags = ", ".join(f"--{p}" for p in ACCESS_PORTS)
             raise Abort(
-                "Choose at least one access method: --ssh, --rdp, or both.\n"
-                "A slot with neither can reach defended terrain but nothing "
+                f"Choose at least one access method: {flags}.\n"
+                "A slot with none can reach defended terrain but nothing "
                 "can reach it, which is almost never what is wanted. If it "
                 "really is, say so explicitly by deleting the slot's access "
                 "rules afterwards."
