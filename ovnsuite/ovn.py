@@ -1,9 +1,15 @@
 """
 Thin helpers around ovn-nbctl / ovn-sbctl / ovs-vsctl.
 
-These are all READ-ONLY queries. Mutating commands stay as explicit
-``ctx.run("ovn-nbctl", ...)`` calls in the command modules so they remain
-visible in the --dry-run listing exactly as the shell version printed them.
+Almost all of these are READ-ONLY queries. Mutating commands stay as
+explicit ``ctx.run("ovn-nbctl", ...)`` calls in the command modules so they
+remain visible in the --dry-run listing exactly as the shell version
+printed them.
+
+The one exception is ``add_acl`` below: it has a version-compatibility
+fallback that two separate command modules would otherwise each have to
+carry a copy of. It still goes through ctx.run, so it prints under
+--dry-run like everything else.
 """
 
 from __future__ import annotations
@@ -215,6 +221,72 @@ def pg_snapshot(ctx: Ctx) -> dict[str, PortGroup]:
                   if u in acl_by_uuid],
         )
     return groups
+
+
+def acl_index(ctx: Ctx) -> dict[tuple[str, str, str], tuple[str, str]]:
+    """(direction, priority, match) -> (row uuid, current name).
+
+    That triple is what ovn-nbctl's --may-exist treats as an ACL's
+    identity, so it is the right key for "have I already created this
+    one, and does it carry the name I meant it to?".
+    """
+    index: dict[tuple[str, str, str], tuple[str, str]] = {}
+    for row in nb_json(ctx, "_uuid,direction,priority,match,name", "ACL"):
+        if len(row) < 5:
+            continue
+        uuids = uuid_list(row[0])
+        if not uuids:
+            continue
+        key = (str(row[1] or ""), str(row[2]), str(row[3] or ""))
+        index[key] = (uuids[0], _scalar(row[4]))
+    return index
+
+
+def _scalar(value) -> str:
+    """An optional ovsdb column: ['set', []] when unset, a bare value when
+    set. A bare str() of the unset form yields the literal "['set', []]"."""
+    if isinstance(value, list):
+        if len(value) == 2 and value[0] == "set":
+            return str(value[1][0]) if value[1] else ""
+        return ""
+    return str(value) if value is not None else ""
+
+
+# ovn-nbctl grew --name for acl-add alongside the ACL table's name column.
+# Probed once per process by trying it: a version check would have to map
+# release numbers to behaviour, and the command itself is authoritative.
+_acl_name_unsupported = False
+
+
+def add_acl(ctx: Ctx, group: str, direction: str, priority, match: str,
+            action: str, name: str = "") -> None:
+    """`ovn-nbctl acl-add` against a port group, carrying a name.
+
+    The name is what `ovnctl show` and `ovn-nbctl acl-list` print. Without
+    it every rule displays as '-' and the only way to tell two ACLs apart
+    is to read their match strings, which is exactly the situation the
+    declarative rule names exist to avoid.
+    """
+    global _acl_name_unsupported
+    head = ["ovn-nbctl", "--may-exist", "--type=port-group"]
+    tail = ["acl-add", group, direction, str(priority), match, action]
+
+    if name and not _acl_name_unsupported:
+        res = ctx.run(*head, f"--name={name}", *tail)
+        if res:
+            return
+        # Only treat this as a version problem if the complaint is about
+        # the option itself. Any other failure (a malformed match, a
+        # missing group) must surface as it always did rather than being
+        # silently retried into a differently-broken state.
+        if "name" not in (res.stderr or "").lower():
+            return
+        _acl_name_unsupported = True
+        ctx.warn("This ovn-nbctl does not accept --name on acl-add -- ACLs "
+                 "will be created unnamed and `ovnctl show` will print '-' "
+                 "in the NAME column.")
+
+    ctx.run(*head, *tail)
 
 
 def acl_list(ctx: Ctx, target: str) -> list[str]:

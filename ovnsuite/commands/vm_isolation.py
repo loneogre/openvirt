@@ -220,17 +220,17 @@ class VMIsolation:
 
             ctx.log("Adding from-lport allow (outbound to external/shadow) at "
                     f"priority {self.allow_priority}...")
-            ctx.run("ovn-nbctl", "--may-exist", "--type=port-group", "acl-add",
-                    self.pg_name, "from-lport", self.allow_priority,
-                    f"inport == @{self.pg_name} && ip4 && ip4.dst == {allow_set}",
-                    "allow-related")
+            ovn.add_acl(ctx, self.pg_name, "from-lport", self.allow_priority,
+                        f"inport == @{self.pg_name} && ip4 && "
+                        f"ip4.dst == {allow_set}",
+                        "allow-related", name="isolated-allow-out")
 
             ctx.log("Adding to-lport allow (inbound from external/shadow) at "
                     f"priority {self.allow_priority}...")
-            ctx.run("ovn-nbctl", "--may-exist", "--type=port-group", "acl-add",
-                    self.pg_name, "to-lport", self.allow_priority,
-                    f"outport == @{self.pg_name} && ip4 && ip4.src == {allow_set}",
-                    "allow-related")
+            ovn.add_acl(ctx, self.pg_name, "to-lport", self.allow_priority,
+                        f"outport == @{self.pg_name} && ip4 && "
+                        f"ip4.src == {allow_set}",
+                        "allow-related", name="isolated-allow-in")
         else:
             ctx.log("No [external_ranges]/[shadow_ranges] declared -- "
                     "no allow tier needed.")
@@ -242,21 +242,54 @@ class VMIsolation:
         # port on the switch, including non-members and the router port.
         ctx.log(f"Adding from-lport drop (member -> internal) at priority "
                 f"{self.acl_priority}...")
-        ctx.run("ovn-nbctl", "--may-exist", "--type=port-group", "acl-add",
-                self.pg_name, "from-lport", self.acl_priority,
-                f"inport == @{self.pg_name} && ip4 && "
-                f"ip4.dst == {self.internal_match_set}", "drop")
+        ovn.add_acl(ctx, self.pg_name, "from-lport", self.acl_priority,
+                    f"inport == @{self.pg_name} && ip4 && "
+                    f"ip4.dst == {self.internal_match_set}", "drop",
+                    name="isolated-drop-out")
 
         ctx.log(f"Adding to-lport drop (internal -> member) at priority "
                 f"{self.acl_priority}...")
-        ctx.run("ovn-nbctl", "--may-exist", "--type=port-group", "acl-add",
-                self.pg_name, "to-lport", self.acl_priority,
-                f"outport == @{self.pg_name} && ip4 && "
-                f"ip4.src == {self.internal_match_set}", "drop")
+        ovn.add_acl(ctx, self.pg_name, "to-lport", self.acl_priority,
+                    f"outport == @{self.pg_name} && ip4 && "
+                    f"ip4.src == {self.internal_match_set}", "drop",
+                    name="isolated-drop-in")
+
+        self._name_existing_acls()
 
         ctx.log("Traffic to anything NOT in [internal_ranges] is unaffected --")
         ctx.log("OVN's default with no matching ACL is allow, so it falls through")
         ctx.log("to lr-core and the ASA reroute policy untouched.")
+
+    def _name_existing_acls(self) -> None:
+        """Backfill names on ACLs created before they carried one.
+
+        --may-exist makes acl-add a no-op when the (direction, priority,
+        match) triple is already there, so it will not apply a name to an
+        existing row. Every deployment built before named ACLs is in that
+        state; reconcile the column rather than requiring a teardown to
+        get readable output from `ovnctl show`.
+        """
+        ctx = self.ctx
+        if ctx.dry_run:
+            return
+        wanted = {
+            ("from-lport", str(self.acl_priority),
+             f"inport == @{self.pg_name} && ip4 && "
+             f"ip4.dst == {self.internal_match_set}"): "isolated-drop-out",
+            ("to-lport", str(self.acl_priority),
+             f"outport == @{self.pg_name} && ip4 && "
+             f"ip4.src == {self.internal_match_set}"): "isolated-drop-in",
+        }
+        index = ovn.acl_index(ctx)
+        for key, name in wanted.items():
+            entry = index.get(key)
+            if not entry:
+                continue
+            uuid, current = entry
+            if current == name:
+                continue
+            if not ctx.run("ovn-nbctl", "set", "acl", uuid, f"name={name}"):
+                ctx.warn(f"Could not set name '{name}' on ACL {uuid}.")
 
     # -- 3 ---------------------------------------------------------------
     def verify_scope(self) -> None:

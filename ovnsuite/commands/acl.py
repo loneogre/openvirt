@@ -228,10 +228,46 @@ class ACLManager:
                     continue
 
             match = self.build_match(direction, group, rule.specs)
-            ctx.run("ovn-nbctl", "--may-exist", "--type=port-group", "acl-add",
-                    group, direction, priority, match, action)
+            ovn.add_acl(ctx, group, direction, priority, match, action,
+                        name=name)
             ctx.log(f"  {name}: [{priority}] {direction} {action}")
             ctx.log(f"      {match}")
+
+        self.name_existing_rules()
+
+    def name_existing_rules(self) -> None:
+        """Backfill the name on ACLs that were created without one.
+
+        --may-exist makes acl-add a no-op when the (direction, priority,
+        match) triple already exists, which means it does NOT apply a name
+        to a row that predates named ACLs. Every deployment built before
+        this change is in exactly that state, so reconcile the column
+        directly rather than making people tear their ACLs down to get
+        readable output.
+        """
+        ctx = self.ctx
+        if ctx.dry_run:
+            return
+        index = ovn.acl_index(ctx)
+        if not index:
+            return
+        fixed = 0
+        for rule in self.parsed_rules():
+            if rule.error or not rule.name:
+                continue
+            match = self.build_match(rule.direction, rule.group, rule.specs)
+            entry = index.get((rule.direction, str(rule.priority), match))
+            if not entry:
+                continue
+            uuid, current = entry
+            if current == rule.name:
+                continue
+            if ctx.run("ovn-nbctl", "set", "acl", uuid, f"name={rule.name}"):
+                fixed += 1
+            else:
+                ctx.warn(f"Could not set name '{rule.name}' on ACL {uuid}.")
+        if fixed:
+            ctx.log(f"Named {fixed} previously-unnamed ACL(s).")
 
     # ------------------------------------------------------------------
     def do_list(self) -> None:
