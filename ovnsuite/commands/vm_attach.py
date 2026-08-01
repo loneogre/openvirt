@@ -17,15 +17,40 @@ is reported rather than silently wired to the wrong port.
 from __future__ import annotations
 
 import argparse
+import json
 import time
 
-from .. import libvirtutil, ovn
+from .. import libvirtutil, ovn, paths
 from ..context import Abort, Ctx
 from ..inventory import VM, Inventory
 from ..steps import StepRunner, add_step_args
 
 NAME = "vm-attach"
 HELP = "re-attach running VM taps to br-int"
+
+
+def _user_vm_records(ctx: Ctx) -> list[VM]:
+    """user-vm slots, read from their allocation file.
+
+    They live outside [vm_config] because they are allocated at runtime
+    rather than declared, but as far as this command is concerned they are
+    ordinary VMs with a MAC and a logical port. Read the file directly --
+    importing the user-vm command here would be a circular dependency for
+    the sake of four fields.
+    """
+    path = paths.state_dir() / "user-vms.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    out: list[VM] = []
+    for record in (data.get("slots") or {}).values():
+        if not record.get("mac") or not record.get("uuid"):
+            continue
+        out.append(VM(name=record.get("name", "user-vm"),
+                      uuid=record["uuid"], mac=record["mac"],
+                      ip=record.get("ip", ""), group="user", switch=""))
+    return sorted(out, key=lambda v: v.name)
 
 # How long to wait for ovn-controller to claim a freshly attached port.
 #
@@ -77,7 +102,15 @@ class VMAttach:
         if not self.inv.all:
             raise Abort("No [vm_config] inventory in ovn-settings.yaml -- "
                         "cannot map taps to ports.")
-        ctx.log(f"Loaded {len(self.inv.all)} VMs from the inventory.")
+        # user-vm slots are NOT in [vm_config] -- they are allocated at
+        # runtime and recorded in state/user-vms.json. Without them here,
+        # a user VM's tap has a MAC this command cannot match, so it is
+        # reported as "not in the inventory" and never attached: the one
+        # class of VM whose owner is least able to debug it.
+        self.vms = list(self.inv.all) + _user_vm_records(ctx)
+        extra = len(self.vms) - len(self.inv.all)
+        ctx.log(f"Loaded {len(self.inv.all)} VMs from the inventory"
+                + (f" and {extra} user-vm slot(s)." if extra else "."))
         self.attached = 0
         self.skipped = 0
         self.unknown = 0
@@ -86,6 +119,13 @@ class VMAttach:
         # only ones worth waiting on -- a powered-off VM has no tap and
         # will never bind, which is not a fault.
         self.expect_bound: list[tuple[VM, str]] = []
+
+    def _by_mac(self, mac: str):
+        want = mac.lower()
+        for vm in self.vms:
+            if vm.mac.lower() == want:
+                return vm
+        return None
 
     # ------------------------------------------------------------------
     def check_bridge(self) -> None:
@@ -105,7 +145,7 @@ class VMAttach:
 
         for domain in domains:
             for iface in libvirtutil.domiflist(ctx, domain):
-                vm = self.inv.by_mac(iface.mac)
+                vm = self._by_mac(iface.mac)
                 if vm is None:
                     ctx.warn(f"{domain}: tap {iface.tap} has MAC {iface.mac}, "
                              "which is not in the inventory.")
@@ -432,7 +472,7 @@ class VMAttach:
         print("=== Port binding status ===")
         print(f"{'VM':<10} {'PORT (iface-id)':<38} {'TAP':<10} CHASSIS")
         problems = 0
-        for vm in self.inv.all:
+        for vm in self.vms:
             tap = ovn.iface_for_iface_id(ctx, vm.uuid)
             chassis = ovn.port_binding_chassis(ctx, vm.uuid)
             if chassis:

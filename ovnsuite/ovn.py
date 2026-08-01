@@ -304,17 +304,30 @@ def add_acl(ctx: Ctx, group: str, direction: str, priority, match: str,
         if res:
             return
         # Only treat this as a version problem if the complaint is about
-        # the option itself. Any other failure (a malformed match, a
-        # missing group) must surface as it always did rather than being
-        # silently retried into a differently-broken state.
-        if "name" not in (res.stderr or "").lower():
+        # the OPTION. Testing for the word "name" anywhere in stderr was
+        # far too loose: "port group name not found" contains it, so a
+        # missing port group was reported as an ovn-nbctl that does not
+        # support --name, and the real error never appeared.
+        err = (res.stderr or "").lower()
+        option_problem = any(phrase in err for phrase in (
+            "unrecognized option", "unknown option", "invalid option",
+            "--name",
+        ))
+        if not option_problem:
+            ctx.warn(f"acl-add failed on {group}: "
+                     f"{res.stderr.splitlines()[0] if res.stderr else '?'}")
             return
         _acl_name_unsupported = True
         ctx.warn("This ovn-nbctl does not accept --name on acl-add -- ACLs "
                  "will be created unnamed and `ovnctl show` will print '-' "
                  "in the NAME column.")
 
-    ctx.run(*head, *tail)
+    # The unnamed path, and the retry after the above. Report failure:
+    # a silent one here is how a port group ends up with no ACLs at all.
+    res = ctx.run(*head, *tail)
+    if not res:
+        ctx.warn(f"acl-add failed on {group} ({direction} {priority}): "
+                 f"{res.stderr.splitlines()[0] if res.stderr else '?'}")
 
 
 def acl_list(ctx: Ctx, target: str) -> list[str]:

@@ -313,7 +313,16 @@ class UserVM:
         ctx.run("ovn-nbctl", "lsp-set-addresses", peer, "router")
         ctx.run("ovn-nbctl", "lsp-set-options", peer, f"router-port={self.lrp}")
 
-        ctx.run("ovn-nbctl", "--may-exist", "pg-add", self.pg_name)
+        # NOT `--may-exist`: ovn-nbctl does not accept that option on
+        # pg-add, and the whole command fails if it is passed. The port
+        # group then never exists, every acl-add against it fails with
+        # "port group name not found", and the segment ends up with a
+        # switch and no policy. Check for existence instead -- and do NOT
+        # delete-and-recreate the way acl.py does, because that would
+        # discard the members and ACLs on every run.
+        if not ovn.pg_exists(ctx, self.pg_name):
+            ctx.run("ovn-nbctl", "pg-add", self.pg_name)
+            ctx.log(f"Created port group {self.pg_name}.")
         self.segment_acls()
 
     def segment_acls(self) -> None:
