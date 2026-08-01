@@ -310,6 +310,18 @@ policy:
   priority_source_override: 300
   priority_shadow: 200
   priority_external: 150
+  # The split is TWO policies, not one:
+  #   priority_split_allow  dst IS internal      -> allow (route normally)
+  #   priority_split        everything from src  -> reroute to the ASA
+  #
+  # It used to be a single rule with a negated destination ("reroute
+  # everything except our ranges"). Negation is where OVN's expression
+  # engine does its expensive work -- it computes the complement of each
+  # prefix -- and on this deployment four such logical flows cost 3 GB of
+  # ovn-controller memory, growing to 14 GB as logical ports were added,
+  # while producing no extra OpenFlow rules. Expressed positively it costs
+  # nothing. Keep priority_split_allow above priority_split.
+  priority_split_allow: 110
   priority_split: 100
   external_only_ips:
     # DO NOT add ext-vm1 (172.31.1.34) here, even though it is now in
@@ -406,7 +418,7 @@ vm_isolation:
 # allow rule for them would punch a hole in that.
 # ----------------------------------------------------------------------------
 acls:
-  enabled: false
+  enabled: true
 
   # Named port sets, referenced from a rule as tcp=@name / udp=@name.
   # FreeIPA client enrolment (ipa-client-install) needs all of these.

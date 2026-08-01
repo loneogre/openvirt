@@ -103,6 +103,11 @@ class LocalnetExternal:
 
         # --- priorities -----------------------------------------------
         self.prio_src_override = c.cfg("policy", "priority_source_override")
+        # The "internal destinations are not rerouted" half of the split.
+        # Must outrank priority_split; it is what replaces the negated
+        # destination match that used to live in that rule.
+        self.prio_split_allow = c.cfg_opt("policy", "priority_split_allow",
+                                          "110")
         self.prio_target = c.cfg("engagement", "priority_target")
         self.prio_shadow = c.cfg("policy", "priority_shadow")
         self.prio_external = c.cfg("policy", "priority_external")
@@ -368,18 +373,24 @@ class LocalnetExternal:
     # ------------------------------------------------------------------
     # the policy tiers
     # ------------------------------------------------------------------
-    def _policy_replace(self, priority: str, signature: str, match: str) -> None:
+    def _policy_replace(self, priority: str, signature: str, match: str,
+                        action: str = "reroute") -> None:
         """Replace any policy at <priority> whose match contains <signature>.
 
         Keeps re-runs idempotent even when the range lists change between
-        runs.
+        runs. `allow` policies take no next-hop -- they mean "stop policy
+        evaluation and route normally".
         """
         ctx = self.ctx
         for uuid, existing_match in ovn.policies_with_match(ctx, priority):
             if signature in existing_match:
                 ctx.run("ovn-nbctl", "lr-policy-del", self.lr_core, uuid)
-        ctx.run("ovn-nbctl", "lr-policy-add", self.lr_core, priority, match,
-                "reroute", self.next_hop)
+        if action == "allow":
+            ctx.run("ovn-nbctl", "lr-policy-add", self.lr_core, priority,
+                    match, "allow")
+        else:
+            ctx.run("ovn-nbctl", "lr-policy-add", self.lr_core, priority,
+                    match, "reroute", self.next_hop)
 
     def policy(self) -> None:
         ctx = self.ctx
@@ -460,13 +471,43 @@ class LocalnetExternal:
         # An address set is one complement instead of six, and northd
         # handles it with a conjunctive match. Same semantics, and the
         # flow count stops being a function of how many ranges are declared.
+        # NO NEGATION. Two positive policies instead of one negated match.
+        #
+        # This rule used to say "reroute everything from the VM subnet
+        # EXCEPT our internal ranges", written as a negated destination.
+        # Negation is where OVN's expression engine does its expensive
+        # work: it computes the complement of each prefix -- every prefix
+        # covering the rest of IPv4 -- and the intermediate result is
+        # enormous even when the final flow count is not. Measured on this
+        # deployment: FOUR logical flows cost 3 GB of ovn-controller
+        # memory, and every logical port added afterwards multiplied it,
+        # reaching 14 GB while producing no extra OpenFlow rules at all.
+        # Moving from six negated terms to one address-set negation fixed
+        # the flow count (345,000 -> 606) but not the cost of computing it.
+        #
+        # The same policy expressed positively:
+        #
+        #   higher priority: dst IS internal      -> allow (route normally)
+        #   lower priority:  everything from src  -> reroute to the ASA
+        #
+        # `allow` means "stop evaluating policies and use the routing
+        # table", so internal destinations fall through to their connected
+        # routes exactly as the exclusions intended. Identical behaviour,
+        # no complement to compute.
         as_ref = self._internal_address_set()
-        match = f"ip4.src == {self.split_subnet} && ip4.dst != {as_ref}"
-        ctx.log(f"  [{self.prio_split}] split (fall-through): src "
-                f"{self.split_subnet}, excluding {len(self.internal_ranges)} "
-                f"internal range(s) via {as_ref}")
+
+        ctx.log(f"  [{self.prio_split_allow}] internal destinations: route "
+                f"normally (no reroute)")
+        self._policy_replace(
+            self.prio_split_allow, f"ip4.src == {self.split_subnet} &&",
+            f"ip4.src == {self.split_subnet} && ip4.dst == {as_ref}",
+            action="allow")
+
+        ctx.log(f"  [{self.prio_split}] split (fall-through): everything else "
+                f"from {self.split_subnet} -> ASA")
         self._policy_replace(self.prio_split,
-                             f"ip4.src == {self.split_subnet} &&", match)
+                             f"ip4.src == {self.split_subnet}",
+                             f"ip4.src == {self.split_subnet}")
 
         ctx.log("Policy tiers applied. Verify with: "
                 f"ovn-nbctl lr-policy-list {self.lr_core}")
