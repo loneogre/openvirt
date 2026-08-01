@@ -279,12 +279,21 @@ class VMAttach:
                      "and cannot be")
             ctx.warn("         stopped cleanly -- every symptom in this "
                      "report follows from it.")
-            ctx.warn("         This is the daemon, not the deployment. "
-                     "Investigate:")
-            ctx.warn("           ovn-sbctl --columns=_uuid list MAC_Binding "
-                     "| wc -l")
-            ctx.warn("           ovn-sbctl list Logical_Flow | wc -l")
-            ctx.warn("           ovn-controller --version")
+            ctx.warn("         This is the daemon, not the deployment.")
+            sizes = ovn.sb_table_sizes(ctx)
+            ctx.warn("         Southbound row counts: " + ", ".join(
+                f"{k}={v}" for k, v in sizes.items()))
+            if sizes.get("MAC_Binding", 0) > 1000:
+                ctx.warn("         MAC_Binding is large -- it grows from "
+                         "observed traffic, not")
+                ctx.warn("         from configuration, and is the usual "
+                         "cause of controller")
+                ctx.warn("         memory that does not match the topology.")
+            else:
+                ctx.warn("         None of these explain the memory. That "
+                         "points at the daemon")
+                ctx.warn("         itself: check `ovn-controller --version` "
+                         "against known leaks.")
             ctx.warn("         A restart reclaims the memory but does not "
                      "address the cause.")
 
