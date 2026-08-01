@@ -233,21 +233,14 @@ def acl_index(ctx: Ctx) -> dict[tuple[str, str, str], dict]:
     one, and does it carry the name, logging and meter I meant it to?".
     """
     index: dict[tuple[str, str, str], dict] = {}
-    cols = "_uuid,direction,priority,match,name,log,severity,meter"
-    for row in nb_json(ctx, cols, "ACL"):
-        if len(row) < 8:
+    for row in nb_json(ctx, "_uuid,direction,priority,match,name", "ACL"):
+        if len(row) < 5:
             continue
         uuids = uuid_list(row[0])
         if not uuids:
             continue
         key = (str(row[1] or ""), str(row[2]), str(row[3] or ""))
-        index[key] = {
-            "uuid": uuids[0],
-            "name": _scalar(row[4]),
-            "log": row[5] is True,
-            "severity": _scalar(row[6]),
-            "meter": _scalar(row[7]),
-        }
+        index[key] = {"uuid": uuids[0], "name": _scalar(row[4])}
     return index
 
 
@@ -268,29 +261,21 @@ _acl_name_unsupported = False
 
 
 def add_acl(ctx: Ctx, group: str, direction: str, priority, match: str,
-            action: str, name: str = "", log: bool = False,
-            severity: str = "", meter: str = "") -> None:
-    """`ovn-nbctl acl-add` against a port group, with its presentation
-    options.
+            action: str, name: str = "") -> None:
+    """`ovn-nbctl acl-add` against a port group, carrying a name.
 
     The name is what `ovnctl show` and `ovn-nbctl acl-list` print. Without
     it every rule displays as '-' and the only way to tell two ACLs apart
     is to read their match strings, which is exactly the situation the
     declarative rule names exist to avoid.
 
-    log/severity/meter turn on ovn-controller's acl_log output for this
-    one ACL. The name matters twice over once logging is on: it is the
-    identifier that appears in every log line, so an unnamed logging ACL
-    produces records nobody can trace back to a rule.
+    NO LOGGING. Per-ACL logging was removed while investigating
+    ovn-controller memory use -- see the note in ovn-settings.yaml. Adding
+    it back means restoring --log/--severity/--meter here and the
+    [acl_log] handling in the acl command.
     """
     global _acl_name_unsupported
     head = ["ovn-nbctl", "--may-exist", "--type=port-group"]
-    if log:
-        head.append("--log")
-        if severity:
-            head.append(f"--severity={severity}")
-        if meter:
-            head.append(f"--meter={meter}")
     tail = ["acl-add", group, direction, str(priority), match, action]
 
     if name and not _acl_name_unsupported:

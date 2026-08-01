@@ -334,11 +334,11 @@ class UserVM:
         ovn.add_acl(ctx, self.pg_name, "from-lport", self.drop_priority,
                     f"inport == @{self.pg_name} && ip4 && "
                     f"ip4.dst == {block_set}", "drop",
-                    name="uservm-drop-out", log=True, severity="info")
+                    name="uservm-drop-out")
         ovn.add_acl(ctx, self.pg_name, "to-lport", self.drop_priority,
                     f"outport == @{self.pg_name} && ip4 && "
                     f"ip4.src == {block_set}", "drop",
-                    name="uservm-drop-in", log=True, severity="info")
+                    name="uservm-drop-in")
         ctx.log(f"Isolation ACLs on {self.pg_name} (blocking {len(blocked)} "
                 "range(s), including this segment itself).")
 
@@ -412,8 +412,7 @@ class UserVM:
                 ctx, self.pg_name, "to-lport", self.access_priority,
                 f'outport == "{port_uuid}" && ip4 && '
                 f'ip4.src == {self.mgmt_src} && tcp && tcp.dst == {port}',
-                "allow-related", name=f"{_acl_stem(name)}-{proto}-in",
-                log=True, severity="info")
+                "allow-related", name=f"{_acl_stem(name)}-{proto}-in")
             ctx.log(f"  {proto.upper()} in from {self.mgmt_src} "
                     f"(tcp/{port}) -- allowed.")
         if not access:
@@ -494,7 +493,15 @@ class UserVM:
         ctx = self.ctx
         records = self.records()
         if not records:
-            ctx.log("No slots allocated -- nothing to rebuild.")
+            # The normal state on a fresh deployment, and on every
+            # deployment where nobody has asked for a slot. Say what was
+            # checked rather than just "nothing to do" -- this runs as a
+            # deploy stage, and a silent stage that exists to protect
+            # something invisible is one people delete.
+            ctx.log(f"No slots allocated in {self.alloc.path} -- nothing to "
+                    "rebuild.")
+            ctx.log("The segment is created on the first "
+                    "`ovnctl user-vm --create`.")
             return 0
 
         self.ensure_segment()

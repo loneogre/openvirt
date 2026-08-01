@@ -426,8 +426,8 @@ acls:
   rules:
     # --- management SSH in, no lateral SSH -----------------------------
     - "ssh-mgmt-in     to-lport   2000 allow-related pg_vms src=172.31.1.8/30,172.31.0.0/27 tcp=22"
-    - "ssh-lateral-in  to-lport   1900 drop          pg_vms src=any                         tcp=22 log"
-    - "ssh-lateral-out from-lport 1900 drop          pg_vms dst=internal                    tcp=22 log"
+    - "ssh-lateral-in  to-lport   1900 drop          pg_vms src=any                         tcp=22"
+    - "ssh-lateral-out from-lport 1900 drop          pg_vms dst=internal                    tcp=22"
 
     # --- ext-vm1: isolated, but SSH in from the workstation LAN ---------
     # Priority 1100 > [vm_isolation].acl_priority (1000), which is what
@@ -444,7 +444,7 @@ acls:
     # is dropped by the isolation from-lport rule. allow-related puts the
     # flow in conntrack and the reply is matched by OVN's built-in
     # established/reply rules long before that drop is reached.
-    - "extvm1-ssh-in  to-lport   1100 allow-related pg_ext_mgmt src=172.31.0.0/27 tcp=22 log"
+    - "extvm1-ssh-in  to-lport   1100 allow-related pg_ext_mgmt src=172.31.0.0/27 tcp=22"
 
     # --- FreeIPA domain join: ext-vm2 (.35) -> int-vm4 (.30) ------------
     # Priority 2100 so these survive a future default-deny for lateral
@@ -481,60 +481,24 @@ acls:
 
 
 # ----------------------------------------------------------------------------
-# [acl_log] -- where ACL log records go, and how fast they may arrive.
+# [acl_log] -- REMOVED, temporarily.
 #
-# LOGGING IS PER RULE, and off unless the rule asks for it. Append one of
-# these tokens to a rule in [acls].rules:
+# Per-ACL logging (log / log=SEVERITY / meter= tokens on a rule, plus an
+# rsyslog sink and a rate-limiting meter) was taken out while
+# investigating ovn-controller memory use. The ACLs themselves, their
+# names and their priorities are unchanged -- only the logging is gone.
 #
-#   log            log every packet the rule matches, at .severity below
-#   log=notice     the same, at a specific severity
-#                  (alert | warning | notice | info | debug)
-#   meter=NAME     rate-limit this rule with a named meter of its own
-#   nolog          explicit off, for a rule you are toggling
+# It is worth knowing what logging changed, in case it is implicated:
+# northd compiles a logged or named drop into
+#     log(name=..., verdict=drop); /* drop */
+# rather than a plain `drop;`, and each logging ACL adds a log action and
+# (with a meter) a Meter row. That is a different compiled pipeline, not
+# just an extra annotation.
 #
-# e.g.  - "ssh-lateral-in to-lport 1900 drop pg_vms src=any tcp=22 log"
-#
-# Log DROP rules freely -- they should rarely fire, and when they do you
-# want the record. Think hard before logging an ALLOW rule on a busy
-# segment: it writes a line per packet, to the same disk the captures go
-# to. The meter below is applied to every logging rule for that reason.
-#
-# HOW THE DIRECTORY IS IMPLEMENTED. OVN has no per-ACL log destination.
-# log=true makes ovn-controller emit the record through its own vlog, and
-# that is all OVN offers -- the records land wherever ovn-controller logs,
-# mixed in with everything else it says. So `ovnctl acl` does two things:
-#   1. ovn-appctl vlog/set acl_log:syslog:<severity>
-#   2. writes /etc/rsyslog.d/10-ovn-acl.conf, filing anything containing
-#      'acl_log' into <directory>/<filename> and stopping it there, so it
-#      does not also fill /var/log/messages
-#
-# Set manage_sink: false to keep the per-rule logging but configure the
-# destination yourself. Records then stay in ovn-controller's log:
-#   journalctl -u ovn-controller | grep acl_log
-#
-# NOTE: the vlog level is RUNTIME state and does not survive an
-# ovn-controller restart. `ovnctl reconcile` re-applies it at boot; if you
-# restart the controller by hand, re-run `ovnctl acl --only log-sink` or
-# the logging stops while the ACLs still claim log=true.
-#
-# Rotation is not configured here -- add a logrotate drop-in for the file
-# below if you expect volume.
+# To restore: re-add --log/--severity/--meter to ovn.add_acl, the
+# [acl_log] handling and the log-meter/log-sink steps to the acl command,
+# and the acl-logging step to reconcile.
 # ----------------------------------------------------------------------------
-acl_log:
-  directory: /var/log/ovn-acl
-  filename: acl.log
-  # Default severity for a rule that says bare 'log'.
-  severity: info
-  # Rate limit applied to every logging rule that does not name its own
-  # meter. Packets over the limit are still dropped/allowed as the ACL
-  # says -- only the LOG RECORD is discarded.
-  meter: acl-log-meter
-  rate_pps: 100
-  burst: 50
-  # false = do not touch rsyslog or the vlog level; per-rule log=true is
-  # still applied and records stay in ovn-controller's log.
-  manage_sink: true
-
 # ----------------------------------------------------------------------------
 # [user_vms] -- ovnctl user-vm. Self-service slots for VMs we do not own.
 #
@@ -779,4 +743,4 @@ diagnose:
   # in section 8 should get a reply from.
   gateway: 172.31.1.10
   lrp_int: lrp-int-vm
-  pg_expected_members: 5
+  pg_expected_members: 4
