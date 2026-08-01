@@ -761,6 +761,12 @@ def show_acls() -> None:
 
     lsp_map = get_lsp_details_map()
     vm_name_map = get_lsp_vm_name_map()
+    # The switch and interface views resolve a port to the LIVE libvirt
+    # domain and fall back to the vm-name tag; this view used to read the
+    # tag only, so the same port appeared as two different machines
+    # depending on which section you were looking at. One correlation for
+    # all three.
+    virsh_vms = build_virsh_vm_map()
     total_pg = 0
     for pg_name, pg_info in pg_map.items():
         refs = pg_info["acls"]
@@ -770,8 +776,15 @@ def show_acls() -> None:
         for p_ref in ports:
             info = lsp_map.get(p_ref)
             base = info["name"] if info else p_ref
-            vm_name = vm_name_map.get(base)
-            member_names.append(f"{vm_name} ({base})" if vm_name else base)
+            label = ""
+            if info:
+                label = _vm_domain(info["type"], base, info["addrs"],
+                                   virsh_vms, vm_name_map)
+                # _vm_domain's sentinels say "nothing correlated"; printing
+                # them beside a uuid is worse than printing the uuid alone.
+                if label == "Host / Router" or label.startswith("Unknown"):
+                    label = ""
+            member_names.append(f"{label} ({base})" if label else base)
 
         print(f"\nPORT GROUP: {pg_name:<25} Members: {len(ports)}  "
               f"Total ACLs: {len(refs)}")
@@ -784,7 +797,7 @@ def show_acls() -> None:
             # arbitrary, and it changes as ports are added and removed.
             print("  Member ports:")
             for name in sorted(member_names):
-                print(f"    * {name}")
+                print(f"    - {name}")
         print("  " + "-" * 126)
         total_pg += _print_acl_rows(refs, acl_details)
 
