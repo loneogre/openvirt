@@ -504,103 +504,71 @@ vm_names:
 # ----------------------------------------------------------------------------
 pcap:
   enabled: false
-  # TWO DIRECTORIES.
+  # THE CAPTURE ROOT. Two subdirectories are created under it:
   #
-  # work_dir  tcpdump writes the file it currently has OPEN here. Put it on
-  #           fast local storage -- capture writes are continuous and you do
-  #           not want them competing with the archive volume.
-  # directory the ARCHIVE. On every rotation, tcpdump's -z hook compresses
-  #           the closed file (if compress: true) and moves it here.
+  #   <directory>/inflight/[<vm>/]    tcpdump's open, still-growing file
+  #   <directory>/completed/[<vm>/]   closed files, nothing else
   #
-  # The move is done in two steps -- to a hidden .inflight.* name, then a
-  # rename inside the archive filesystem -- so nothing reading the archive
-  # can ever pick up a half-copied pcap. These are usually different
-  # filesystems, which makes mv a copy-then-unlink rather than atomic.
+  # On every rotation the -z hook moves the closed file from inflight/ to
+  # completed/. Both are under this one path and therefore on one
+  # filesystem, so that move is a rename: the file appears under its final
+  # name complete, or it does not appear at all.
   #
-  # BOTH directories get the capture user's ACL. The rotate hook runs with
-  # tcpdump's DROPPED privileges, so that user must create in the archive
-  # and unlink from work_dir, not just write to work_dir.
+  # THAT IS THE POINT. Whatever transfers these to the Malcolm VM takes
+  # everything in completed/ and ignores inflight/ entirely -- no
+  # CLOSE_WRITE watch, no lsof check, no rule about skipping the newest
+  # file per VM. There is no such thing as a partial file in completed/.
   #
-  # If work_dir is tmpfs (/tmp often is), the open file lives in RAM and is
-  # lost on reboot. Fine, and fast, provided rotate_seconds keeps that file
-  # small. The script checks and warns.
-  # work_dir  staging path for the file tcpdump currently has OPEN. On
-  #           rotation the closed file is moved to `directory`, appearing
-  #           there atomically.
+  # Malcolm cannot ingest from a host directory, only from the upload
+  # directory on the VM it runs on, so that transfer is a separate
+  # mechanism. This layout is the contract it depends on.
   #
-  #           LEAVE IT EMPTY (or set it equal to `directory`) for DIRECT
-  #           mode: tcpdump then writes straight into `directory` with no
-  #           staging and no move. That is right when the consumer removes
-  #           files itself -- Malcolm moves upload/ into processed/ after
-  #           ingest, so the directory drains on its own.
-  #
-  #           Direct mode has one requirement: the consumer must trigger on
-  #           CLOSE_WRITE, not on file creation. tcpdump holds each file
-  #           open for rotate_seconds and it grows the whole time, so a
-  #           watcher that reads on create gets a truncated pcap. If yours
-  #           polls, keep a staging path -- the move is what makes files
-  #           appear complete.
-  work_dir: ""
-  directory: /malcolm/pcap/upload
+  # Do not bind-mount or otherwise separate the two subdirectories. If they
+  # end up on different filesystems the move becomes copy-then-unlink and
+  # the guarantee is gone; --start checks and warns.
+  directory: /malcolm/pcap
+  # Names of the two subdirectories, if the transfer expects something
+  # else. Defaults are fine.
+  inflight_dir: inflight
+  completed_dir: completed
   targets: isolated
   snaplen: 0                # 0 = whole packet; 96 for headers only
   filter: ""                # optional BPF, e.g. "not port 22"
   rotate_seconds: 3600
-  # max_files caps the WORK directory only -- files leave it on every
-  # rotation, so in normal operation it holds one file per VM. It still
-  # matters as a backstop: if the archive fills or the move fails, this is
-  # what stops work_dir growing without limit.
-  max_files: 24             # per VM, work_dir only
-  # archive_max_files caps the ARCHIVE, and 0 means unlimited.
+  # max_files is tcpdump's own -W. With -G it caps how many rotated files
+  # tcpdump will create before it stops, per VM. Files leave inflight/ on
+  # every rotation, so in normal operation that directory holds exactly one
+  # file per VM; this is the backstop for when the hook cannot move them.
+  max_files: 24
+  # archive_max_files caps what is kept in completed/, and 0 means
+  # unlimited.
   #
   # The default is deliberately 0. These are engagement captures, and a
   # script quietly deleting evidence to save disk is a worse failure than a
-  # disk you are already monitoring filling up. Set a number only when you
-  # have decided what you are willing to lose.
+  # disk you are already monitoring filling up. Note that it deletes from
+  # completed/, so a file it removes may be one the transfer has not
+  # collected yet.
   #   24 with rotate_seconds 3600 = the last 24 hours per VM
   archive_max_files: 0
 
   # WHO GETS THE FINISHED CAPTURES
   #
-  # The rotate hook runs with tcpdump's DROPPED privileges (-z fires after
-  # -Z), so it has no CAP_CHOWN and cannot change a file's owner to another
-  # UID. Plan around that rather than against it.
+  # By ACL, never by chown. -Z drops tcpdump's privileges BEFORE the output
+  # file is created, so each pcap is born owned by drop_user and its
+  # primary group. The rotate hook inherits those dropped privileges and
+  # has no CAP_CHOWN, so it could not change ownership even if asked --
+  # which is why the old archive_owner ("1000:1000") setting is gone
+  # rather than merely unset.
   #
-  # archive_reader -- RECOMMENDED. A UID or username granted rwx on the
-  #   archive by ACL, plus a default entry so every rotated file inherits
-  #   it. That is read, write and delete on the captures without anyone
-  #   owning them, which is what an upload process actually needs.
+  # archive_reader -- a UID or username granted rwx on the capture
+  #   directories, plus a default entry so every rotated file inherits it.
+  #   This is what the transfer process needs: read to copy, write to
+  #   delete once it has.
+  #   That is read, write and delete on the captures without anyone owning
+  #   them, and it is what a transfer process actually needs.
   #     archive_reader: 1000
   archive_reader: ""
-  #
-  # archive_owner -- "uid:gid" the hook chowns each moved file to. This
-  #   ONLY works when drop_user is root, i.e. when the privilege drop is
-  #   disabled. Otherwise the script warns at --start and every rotation
-  #   appends to <directory>/.chown-failed.log.
-  #
-  #   If you need literal 1000:1000 in `ls -l` while keeping the privilege
-  #   drop, the safe route is a root-owned wrapper with no arguments:
-  #
-  #     # /usr/local/sbin/ovn-pcap-chown
-  #     #!/bin/sh
-  #     exec chown -R 1000:1000 /var/log/ovn-pcap
-  #
-  #     # /etc/sudoers.d/ovn-pcap
-  #     tcpdump ALL=(root) NOPASSWD: /usr/local/sbin/ovn-pcap-chown
-  #
-  #   No wildcard, no caller-supplied path. A sudoers rule permitting
-  #   `chown` with a wildcard path lets the capture user re-own anything
-  #   matching it -- do not do that.
-  #
-  #   Simpler still: set drop_user to the uid-1000 account and the files
-  #   are created with that ownership from the start. The trade is that
-  #   tcpdump then runs as an account with real access, so a tcpdump
-  #   parsing bug reaches further than it would as a dedicated user.
-  archive_owner: "1000:1000"
   mirror_prefix: mir
-  # Set false in direct mode: the .pcap is closed and visible before gzip
-  # replaces it, so a watcher can ingest the same capture twice.
-  compress: true            # gzip each file as it rotates
   # tcpdump opens the interface as root and then DROPS PRIVILEGES to this
   # user before creating any output file -- a deliberate hardening measure,
   # since it is parsing untrusted traffic. The consequence is that the
@@ -622,17 +590,11 @@ pcap:
   # Requires the acl package and a filesystem mounted with ACL support.
   # Set to "root" to disable the privilege drop entirely (not advised when
   # capturing from untrusted VMs).
-  # OWNERSHIP IS DECIDED HERE, not by any chown.
-  # -Z drops privileges BEFORE the capture file is created, so the pcap is
-  # born owned by this user and its primary group. To get 1000:1000, name
-  # the UID-1000 account:
-  #     getent passwd 1000 | cut -d: -f1
-  # and confirm its primary group is also 1000 (`id <user>`). The script
-  # prints the effective uid:gid at --start so you can check.
   #
-  # The trade: tcpdump then runs as an account with real access rather than
-  # a dedicated capture user, so a tcpdump parsing bug reaches further.
-  # Weigh that against the VMs being captured -- these are the isolated four.
+  # OWNERSHIP IS DECIDED HERE and nowhere else. -Z drops privileges before
+  # the capture file is created, so each pcap is born owned by this account
+  # and its primary group; nothing chowns it afterwards. `--start` prints
+  # the effective uid:gid so you can confirm what the files will look like.
   drop_user: ovnpcap
   min_free_mb: 2048         # warn below this
   # true  -> <directory>/<vm>/<file>
