@@ -51,6 +51,11 @@ def register(subparsers) -> argparse.ArgumentParser:
     p.add_argument("--watch-memory", action="store_true",
                    help="sample ovn-controller's resident memory each second "
                         "while waiting, and print the curve")
+    p.add_argument("--nudge", action="store_true",
+                   help="if a port is still unclaimed halfway through the "
+                        "wait, clear and re-set its iface-id to re-trigger "
+                        "the claim (off by default -- see the note in "
+                        "wait_for_bindings)")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
@@ -58,12 +63,13 @@ def register(subparsers) -> argparse.ArgumentParser:
 
 class VMAttach:
     def __init__(self, ctx: Ctx, timeout: int = DEFAULT_TIMEOUT,
-                 watch_memory: bool = False):
+                 watch_memory: bool = False, nudge: bool = False):
         self.ctx = ctx
         # Sampling the curve is how you tell "allocates enormously on the
         # first claim" from "leaks steadily while running" -- two different
         # bugs that look identical once the number is already huge.
         self.watch_memory = watch_memory
+        self.nudge = nudge
         self.br_int = ctx.cfg("topology", "br_int")
         self.timeout = timeout
         self.inv = Inventory(ctx.config)
@@ -200,13 +206,19 @@ class VMAttach:
             if not pending:
                 break
 
-            # One nudge, halfway through. ovn-controller claims a port in
-            # response to the iface-id appearing; if that event was missed
-            # -- the SB Port_Binding row not having propagated from the NB
-            # db yet is the usual reason, and a purge makes it likely --
-            # nothing will re-fire it on its own. Clearing and re-setting
-            # the key produces the event again.
-            if (not nudged and time.time() > deadline - self.timeout / 2
+            # OPT-IN, and off by default.
+            #
+            # Clearing and re-setting iface-id makes ovn-controller RELEASE
+            # the port and then CLAIM it again. That is the right cure for
+            # a missed event -- the SB Port_Binding row not having
+            # propagated when the key first appeared -- but claiming is
+            # also the expensive operation. On a host where compiling a
+            # datapath already costs gigabytes, forcing a second claim
+            # while the first may still be running is the worst available
+            # move. Enable with --nudge when you know the controller is
+            # healthy and a claim was simply missed.
+            if (self.nudge and not nudged
+                    and time.time() > deadline - self.timeout / 2
                     and rss <= ovn.CONTROLLER_RSS_WARN_MB):
                 nudged = True
                 ctx.log("  Still unclaimed -- re-asserting iface-id to "
@@ -226,6 +238,10 @@ class VMAttach:
         for vm, tap in pending:
             ctx.warn(f"  {vm.name} ({vm.uuid}) tap {tap}")
             self.explain_unbound(vm, tap)
+        if not self.nudge:
+            ctx.warn("If the controller is healthy and the claim was simply "
+                     "missed, `ovnctl vm-attach --nudge` re-asserts iface-id "
+                     "to re-trigger it.")
 
     def explain_unbound(self, vm, tap: str) -> None:
         """Say WHICH of the three causes this is.
@@ -436,7 +452,8 @@ def main(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.require_root()
 
     cmd = VMAttach(ctx, timeout=getattr(args, "timeout", DEFAULT_TIMEOUT),
-                   watch_memory=getattr(args, "watch_memory", False))
+                   watch_memory=getattr(args, "watch_memory", False),
+                   nudge=getattr(args, "nudge", False))
 
     if args.status:
         cmd.print_status()
