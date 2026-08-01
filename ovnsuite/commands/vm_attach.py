@@ -141,6 +141,12 @@ class VMAttach:
         if ctx.dry_run or not self.expect_bound:
             return
 
+        # vm-config wrote the logical ports to the NORTHBOUND db moments
+        # ago; there is no Port_Binding to claim until northd has compiled
+        # them. Waiting on the controller before that is waiting on the
+        # wrong process.
+        ovn.sync_sb(ctx)
+
         pending = list(self.expect_bound)
         ctx.log(f"Waiting up to {self.timeout}s for ovn-controller to claim "
                 f"{len(pending)} port(s)...")
@@ -182,11 +188,73 @@ class VMAttach:
         ctx.warn(f"{len(pending)} port(s) still unbound after {self.timeout}s:")
         for vm, tap in pending:
             ctx.warn(f"  {vm.name} ({vm.uuid}) tap {tap}")
-        ctx.warn("The VMs are running and their taps are on the bridge, so "
+            self.explain_unbound(vm, tap)
+
+    def explain_unbound(self, vm, tap: str) -> None:
+        """Say WHICH of the three causes this is.
+
+        "ovn-controller is not claiming it" was the old message and it is
+        only one of the possibilities -- the other two are not
+        ovn-controller's fault at all, and chasing its log for them wastes
+        the time when the fix is somewhere else entirely:
+
+          1. no SB Port_Binding row  -> northd has not compiled the
+             logical port yet (or vm-config never created it). Nothing to
+             claim. Not an ovn-controller problem.
+          2. the tap is dead in OVS (ofport -1, or an error column) ->
+             usually the tap device disappeared underneath OVS when br-int
+             was recreated. ovn-controller cannot claim a port with no
+             datapath number, and no amount of re-setting iface-id will
+             change that. The VM has to be restarted, or its interface
+             re-attached in libvirt.
+          3. both fine -> genuinely a controller problem, and now the log
+             is worth reading.
+        """
+        ctx = self.ctx
+
+        # 1. Does the port exist in the Southbound db at all?
+        rows = ctx.qout("ovn-sbctl", "--bare", "--columns=_uuid", "find",
+                        "Port_Binding", f"logical_port={vm.uuid}")
+        if not rows.strip():
+            ctx.warn("    No Southbound Port_Binding row exists for this "
+                     "port.")
+            ctx.warn("    ovn-controller has nothing to claim -- this is "
+                     "northd, not the controller.")
+            ctx.warn(f"    Check: ovn-nbctl find Logical_Switch_Port "
+                     f"name={vm.uuid}")
+            ctx.warn("           systemctl status ovn-northd")
+            ctx.warn("    An empty first result means vm-config never made "
+                     "the port;")
+            ctx.warn("    a populated one means northd has not compiled it.")
+            return
+
+        # 2. Is the tap usable by OVS?
+        ofport = ctx.qout("ovs-vsctl", "--if-exists", "get", "interface", tap,
+                          "ofport").strip()
+        error = ctx.qout("ovs-vsctl", "--if-exists", "get", "interface", tap,
+                         "error").strip()
+        if ofport in ("-1", "[]", "") or (error and error != "[]"):
+            ctx.warn(f"    The tap is not usable by OVS: ofport={ofport or '?'}"
+                     f"{'  error=' + error if error and error != '[]' else ''}")
+            ctx.warn("    A port with no OpenFlow number cannot be claimed, "
+                     "and re-setting")
+            ctx.warn("    iface-id will not change that. The usual cause is "
+                     "the tap device")
+            ctx.warn("    disappearing underneath OVS when br-int was "
+                     "recreated -- libvirt")
+            ctx.warn("    created it against the old bridge and nothing "
+                     "recreated it.")
+            ctx.warn(f"    Fix: virsh destroy/start the domain owning {tap}, "
+                     "then re-run")
+            ctx.warn("         ovnctl vm-attach")
+            return
+
+        # 3. Everything the controller needs is present.
+        ctx.warn("    The port exists in the SB db and the tap is usable, so "
                  "this is")
-        ctx.warn("ovn-controller not claiming them. Check:")
-        ctx.warn("  journalctl -u ovn-controller -e --no-pager | tail -30")
-        ctx.warn("  ovnctl diagnose")
+        ctx.warn("    ovn-controller declining to claim it. Check:")
+        ctx.warn("      journalctl -u ovn-controller -e --no-pager | tail -30")
+        ctx.warn("      ovnctl diagnose")
 
     # ------------------------------------------------------------------
     def print_status(self) -> None:
