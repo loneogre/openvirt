@@ -794,7 +794,14 @@ class Diagnose:
                 f'eth.dst=={victim.mac} && ip4.src=={self.gateway} && '
                 f'ip4.dst=={victim.ip} && ip.ttl==63 && icmp4')
         out = ovn.trace(ctx, self.ls_ext, expr)
-        if trace_verdict(out) == "DROP":
+        verdict = trace_verdict(out)
+        if verdict == "UNKNOWN":
+            self.note("ovn-trace gave no usable verdict -- scope not proven "
+                      "either way.")
+            self.detail("Usually ovn-trace timing out on a large Southbound db.",
+                        f"  ovn-trace {self.ls_ext} '{expr}'")
+            return
+        if verdict == "DROP":
             self.bad(f"LIVE PROOF: non-member {victim.name} ({victim.ip}) is "
                      "being DROPPED.")
             self.detail("This is a switch-wide outage for every non-isolated VM on",
@@ -853,8 +860,12 @@ class Diagnose:
                         f'inport=="{v1.uuid}" && eth.src=={v1.mac} && '
                         f'eth.dst=={v2.mac} && ip4.src=={v1.ip} && '
                         f'ip4.dst=={v2.ip} && ip.ttl==64 && tcp && tcp.dst==22')
-        if trace_verdict(out) == "DROP":
+        verdict = trace_verdict(out)
+        if verdict == "DROP":
             self.ok(f"Lateral SSH {v1.name} -> {v2.name} is DENIED (correct).")
+        elif verdict == "UNKNOWN":
+            self.note(f"Lateral SSH {v1.name} -> {v2.name}: no verdict "
+                      "(trace failed or timed out).")
         else:
             self.bad(f"Lateral SSH {v1.name} -> {v2.name} is ALLOWED -- "
                      "segmentation is not effective.")
@@ -863,9 +874,13 @@ class Diagnose:
                         f'inport=="{self.ls_int}-to-lr" && eth.src=={lmac} && '
                         f'eth.dst=={v1.mac} && ip4.src=={hip} && '
                         f'ip4.dst=={v1.ip} && ip.ttl==63 && tcp && tcp.dst==22')
-        if trace_verdict(out) == "DROP":
+        verdict = trace_verdict(out)
+        if verdict == "DROP":
             self.bad(f"Management SSH {hip} -> {v1.name} is DENIED -- you have "
                      "locked yourself out.")
+        elif verdict == "UNKNOWN":
+            self.note(f"Management SSH {hip} -> {v1.name}: no verdict "
+                      "(trace failed or timed out).")
         else:
             self.ok(f"Management SSH {hip} -> {v1.name} is allowed (correct).")
 

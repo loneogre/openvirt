@@ -520,6 +520,12 @@ class ACLManager:
         verdict = trace_verdict(out)
         if verdict == expect:
             print(f"  [ OK ] {label:<46} {verdict}")
+        elif verdict == "UNKNOWN":
+            # Not a failure of the policy -- a failure to measure it.
+            # Printing FAIL here would send you to fix a rule that is fine.
+            print(f"  [WARN] {label:<46} no verdict (trace failed/timed out)")
+            for line in (out.splitlines()[-6:] or ["(no output)"]):
+                print(f"         {line}")
         else:
             print(f"  [FAIL] {label:<46} {verdict} (expected {expect})")
             for line in out.splitlines()[-6:]:

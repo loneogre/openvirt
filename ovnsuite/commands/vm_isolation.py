@@ -344,8 +344,18 @@ class VMIsolation:
                 f'eth.dst=={victim.mac} && ip4.src=={host_ip} && '
                 f'ip4.dst=={victim.ip} && ip.ttl==63 && icmp4')
         out = ovn.trace(ctx, self.ls_ext, expr)
+        verdict = trace_verdict(out)
 
-        if trace_verdict(out) == "DROP":
+        if verdict == "UNKNOWN":
+            ctx.warn("ovn-trace produced no usable verdict for the non-member "
+                     "probe --")
+            ctx.warn("scope has NOT been verified. Output was:")
+            ctx.note_stderr(out or "(nothing)")
+            ctx.warn("Verify by hand before trusting this isolation:")
+            ctx.warn(f"  ovn-trace {self.ls_ext} '{expr}'")
+            return
+
+        if verdict == "DROP":
             ctx.err(f"SCOPE FAILURE: traffic to NON-member {victim.name} "
                     f"({victim.ip}) is being DROPPED.")
             ctx.err("The ACLs are applying to the whole switch instead of just "
@@ -370,6 +380,8 @@ class VMIsolation:
         # said nothing at all about the other three.
         blocked: list[str] = []
         unblocked: list[str] = []
+        unknown: list[str] = []
+        last_expr = last_out = ""
         for m_name, m_uuid, m_ip in self.isolated:
             member = self.inv.by_uuid(m_uuid)
             if member is None:
@@ -379,14 +391,37 @@ class VMIsolation:
                     f'eth.dst=={member.mac} && ip4.src=={host_ip} && '
                     f'ip4.dst=={target} && ip.ttl==63 && icmp4')
             out = ovn.trace(ctx, self.ls_ext, expr)
-            if trace_verdict(out) == "DROP":
+            verdict = trace_verdict(out)
+            if verdict == "DROP":
                 blocked.append(m_name)
+            elif verdict == "UNKNOWN":
+                unknown.append(f"{m_name} ({target})")
+                last_expr, last_out = expr, out
             else:
                 unblocked.append(f"{m_name} ({target})")
 
         if blocked:
             ctx.log(f"  OK: {len(blocked)} member(s) correctly blocked from "
                     f"internal: {', '.join(blocked)}")
+
+        # Separated deliberately. "the trace could not tell us" and "the
+        # ACL is not working" are completely different problems, and
+        # reporting the first as the second sends you to read acl-list for
+        # a rule that is perfectly correct.
+        if unknown:
+            ctx.warn(f"{len(unknown)} member(s) could NOT be verified -- "
+                     "ovn-trace gave no usable verdict:")
+            for entry in unknown:
+                ctx.warn(f"  {entry}")
+            ctx.warn("This says nothing about whether isolation works. The "
+                     "usual cause is")
+            ctx.warn(f"ovn-trace timing out on a large Southbound db "
+                     f"(limit is {ovn.TRACE_TIMEOUT}s).")
+            ctx.warn("Last trace output was:")
+            ctx.note_stderr(last_out or "(nothing)")
+            ctx.warn("Reproduce with:")
+            ctx.warn(f"  ovn-trace {self.ls_ext} '{last_expr}'")
+
         if not unblocked:
             return
 
@@ -395,8 +430,6 @@ class VMIsolation:
         for entry in unblocked:
             ctx.warn(f"  {entry}")
         ctx.warn(f"Check: ovn-nbctl acl-list {self.pg_name}")
-        ctx.warn(f"       ovn-nbctl --wait=sb sync   (then re-run "
-                 "`ovnctl vm-isolation --only verify-scope`)")
 
     # ------------------------------------------------------------------
     def run_trace(self, src: str, dst: str) -> None:

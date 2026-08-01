@@ -317,17 +317,37 @@ class Ctx:
 
 
 def trace_verdict(output: str) -> str:
-    """ALLOW/DROP from an ovn-trace, in both stateless and stateful pipelines.
+    """ALLOW / DROP / UNKNOWN from an ovn-trace.
 
     A stateless drop prints "drop;". But as soon as any ACL uses
     allow-related the pipeline is stateful and northd compiles a drop into
     "ct_commit { ct_mark.blocked = 1; }" with no next/output -- the packet
     still dies, it just never prints "drop;". Matching only "drop;" reports
     those as ALLOW, which is the worst direction to be wrong in.
+
+    UNKNOWN exists because this used to return ALLOW for ANY output it did
+    not recognise -- including empty output. A trace that timed out, hit a
+    parse error, or never ran at all was therefore indistinguishable from
+    a packet that was permitted, and every caller reported it as a policy
+    failure. On a large Southbound db ovn-trace is slow enough for that to
+    be routine rather than exotic.
+
+    So the ALLOW verdict now requires positive evidence: real ovn-trace
+    output always contains an "ingress(dp=..." line. No pipeline, no
+    verdict.
     """
+    text = output.strip()
+    if not text:
+        return "UNKNOWN"
+    # ovn-trace prefixes its own errors this way; normal output never does.
+    for line in text.splitlines():
+        if line.startswith("ovn-trace:") or line.startswith("timed out"):
+            return "UNKNOWN"
     if "ct_mark.blocked = 1" in output:
         return "DROP"
     for line in output.splitlines():
         if re.match(r"^\s*drop;", line):
             return "DROP"
+    if "ingress(dp=" not in output:
+        return "UNKNOWN"
     return "ALLOW"
