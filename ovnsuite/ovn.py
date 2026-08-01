@@ -129,9 +129,36 @@ def pg_exists(ctx: Ctx, name: str) -> bool:
 
 
 def pg_members(ctx: Ctx, name: str) -> list[str]:
+    """Port_Group.ports -- LOGICAL_SWITCH_PORT ROW UUIDS, not port names.
+
+    Worth stating plainly, because the two are easy to confuse and the
+    confusion is silent: a logical port's NAME is often itself a uuid
+    string (this suite names VM ports after the VM's uuid), so comparing
+    row uuids against names produces two lists that look like uuids,
+    overlap not at all, and give no hint that they are different kinds of
+    thing. Use pg_member_names() to compare against port names.
+    """
     out = ctx.qout("ovn-nbctl", "--bare", "--columns=ports", "list",
                    "Port_Group", name)
     return out.split()
+
+
+def lsp_uuid_names(ctx: Ctx) -> dict[str, str]:
+    """Logical_Switch_Port row uuid -> logical port name."""
+    out: dict[str, str] = {}
+    for row in nb_json(ctx, "_uuid,name", "Logical_Switch_Port"):
+        if len(row) < 2:
+            continue
+        uuids = uuid_list(row[0])
+        if uuids:
+            out[uuids[0]] = str(row[1] or "")
+    return out
+
+
+def pg_member_names(ctx: Ctx, name: str) -> list[str]:
+    """The port group's members as logical port NAMES."""
+    lookup = lsp_uuid_names(ctx)
+    return [lookup.get(u, u) for u in pg_members(ctx, name)]
 
 
 @dataclass(frozen=True)

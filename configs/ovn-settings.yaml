@@ -418,7 +418,7 @@ vm_isolation:
 # allow rule for them would punch a hole in that.
 # ----------------------------------------------------------------------------
 acls:
-  enabled: false
+  enabled: true
 
   # Named port sets, referenced from a rule as tcp=@name / udp=@name.
   # FreeIPA client enrolment (ipa-client-install) needs all of these.
@@ -805,4 +805,14 @@ diagnose:
   # in section 8 should get a reply from.
   gateway: 172.31.1.10
   lrp_int: lrp-int-vm
-  pg_expected_members: 4
+  # pg_expected_members: how many ports pg_isolated should hold.
+  #
+  # LEAVE IT UNSET. It is now derived from [vm_isolation].isolated_vms,
+  # which is the list that actually decides membership. Hardcoding it here
+  # meant two places had to be edited together, and when ext-vm1 was added
+  # to the isolation list this key stayed at 4 and diagnose reported a
+  # correct deployment as drifted.
+  #
+  # Set it only to assert a number deliberately different from that list;
+  # diagnose warns when the two disagree.
+  # pg_expected_members: 5

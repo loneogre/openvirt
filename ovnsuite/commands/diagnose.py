@@ -66,7 +66,12 @@ class Diagnose:
         self.gateway = c.cfg_opt("diagnose", "gateway", "172.31.1.10")
         self.host_ip = c.cfg_opt("setup", "host_if_ip", "")
         self.pg_name = c.cfg_opt("vm_isolation", "pg_name", "pg_isolated")
-        self.pg_expected = c.cfg_int_opt("diagnose", "pg_expected_members", 4)
+        # Set after the inventory is loaded -- see below. A hardcoded count
+        # that has to be kept in step with a list by hand is a false
+        # failure waiting to happen, and it duly happened when ext-vm1 was
+        # added to [vm_isolation].isolated_vms.
+        self._pg_expected_override = c.cfg_opt("diagnose",
+                                               "pg_expected_members", "")
 
         # These two bridges may not exist at all in a single-NIC deployment.
         self.br_internal = c.cfg_opt("localnet_internal", "br_internal",
@@ -88,6 +93,23 @@ class Diagnose:
         self.prio_split = c.cfg_opt("policy", "priority_split", "100")
 
         self.inv = Inventory(c, self.ls_int, self.ls_ext)
+
+        # DERIVED from [vm_isolation].isolated_vms, which is the list that
+        # actually decides membership. The old [diagnose].pg_expected_members
+        # key is honoured when set, for anyone who has a reason to assert a
+        # different number, but it is no longer the default source of
+        # truth -- two places to edit meant one of them was always stale.
+        declared = len(self.inv.isolated_uuids)
+        override = self._pg_expected_override.strip()
+        if override.isdigit():
+            self.pg_expected = int(override)
+            if declared and self.pg_expected != declared:
+                ctx.warn(f"[diagnose].pg_expected_members is {self.pg_expected} "
+                         f"but [vm_isolation].isolated_vms lists {declared}.")
+                ctx.warn("Using the configured override; remove the key to "
+                         "follow the isolation list.")
+        else:
+            self.pg_expected = declared
 
         self.tracker = Tracker(ctx)
         self.has_tracker = self.tracker.exists()
@@ -771,7 +793,8 @@ class Diagnose:
 
         members = len(ovn.pg_members(ctx, self.pg_name))
         if members == self.pg_expected:
-            self.ok(f"{self.pg_name} has the expected {self.pg_expected} members.")
+            self.ok(f"{self.pg_name} has the expected {self.pg_expected} "
+                    f"member(s) (from [vm_isolation].isolated_vms).")
         else:
             self.bad(f"{self.pg_name} has {members} members, expected "
                      f"{self.pg_expected}.")
@@ -978,7 +1001,11 @@ class Diagnose:
             self.detail("Nothing is isolating them. -> ovnctl user-vm --reapply")
             return
 
-        members = set(ovn.pg_members(ctx, pg_name))
+        # NAMES, not row uuids. Port_Group.ports holds Logical_Switch_Port
+        # row uuids; the allocation file holds logical port names. Both
+        # look like uuids, so comparing them directly produced two
+        # disjoint sets and a confident, entirely wrong failure.
+        members = set(ovn.pg_member_names(ctx, pg_name))
         wanted = {r["uuid"] for r in slots.values() if r.get("uuid")}
         missing = wanted - members
         extra = members - wanted
