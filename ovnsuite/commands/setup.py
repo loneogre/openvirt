@@ -362,12 +362,7 @@ class Setup:
                         "(it was on another switch)...")
                 ctx.run("ovn-nbctl", "--if-exists", "lsp-del", self.host_if)
 
-        if not ctx.q("ovs-vsctl", "port-to-br", self.host_if).ok:
-            ctx.run("ovs-vsctl", "add-port", self.br_int, self.host_if,
-                    "--", "set", "interface", self.host_if, "type=internal",
-                    f'mac="{self.host_if_mac}"')
-        else:
-            ctx.log(f"OVS port {self.host_if} already exists, skipping add-port.")
+        self._ensure_ovs_port()
 
         ctx.run("ovn-nbctl", "--may-exist", "lsp-add", self.ls_host, self.host_if)
         ctx.run("ovn-nbctl", "lsp-set-addresses", self.host_if,
@@ -384,6 +379,120 @@ class Setup:
             return
 
         self._verify_and_report()
+
+    # Kernel device kinds that are safe to delete in order to free the
+    # host_if name. They are placeholders: nothing can be reached through
+    # one, so a device of this kind wearing the name can only ever be
+    # something left behind. Anything else -- a bridge, a bond, a VLAN, a
+    # physical NIC -- might be carrying real traffic, so we refuse rather
+    # than guess.
+    PLACEHOLDER_KINDS = ("dummy", "veth")
+
+    def _link_kind(self) -> str:
+        """The kernel's device kind for host_if ('' if it does not exist).
+
+        `ip -d link show` names the kind on the third line: 'openvswitch'
+        for a real OVS internal port, 'dummy' for a placeholder, and so
+        on. The distinction matters because the name is a single global
+        namespace -- whoever creates a device called host-if first owns
+        it, and ovs-vswitchd cannot then create its internal port.
+        """
+        res = self.ctx.q("ip", "-d", "link", "show", "dev", self.host_if)
+        if not res.ok:
+            return ""
+        known = ("openvswitch", "dummy", "veth", "bridge", "bond", "vlan",
+                 "tun", "vxlan", "macvlan", "team", "geneve")
+        for line in res.stdout.splitlines()[1:]:
+            for token in line.split():
+                if token in known:
+                    return token
+        return "unknown"
+
+    def _reclaim_name(self) -> None:
+        """Free the host_if name if a non-OVS device is holding it.
+
+        This is the failure this whole step used to walk straight past. A
+        device called host-if that ovs-vswitchd did not create makes
+        `add-port ... type=internal` fail with
+
+            could not add network device host-if to ofproto (File exists)
+
+        and vswitchd leaves the row in place with ofport -1, admin_state
+        unset and error set. Everything downstream then looks healthy --
+        the port is on br-int, the iface-id is right, the address and the
+        routes apply to the kernel device that IS there -- while
+        ovn-controller has no ofport to bind and the host can reach
+        nothing. A NetworkManager profile that creates a device (dummy,
+        bridge, bond) is the usual way to end up here, and it recreates
+        the device at every boot, so this has to be handled rather than
+        reported once.
+        """
+        ctx = self.ctx
+        kind = self._link_kind()
+        if kind in ("", "openvswitch"):
+            return
+
+        if kind not in self.PLACEHOLDER_KINDS:
+            raise Abort(
+                f"a {kind} device named '{self.host_if}' already exists, so "
+                f"ovs-vswitchd cannot create its internal port of that name.\n"
+                f"It is not a placeholder, so it will not be removed "
+                f"automatically. Inspect it (ip -d link show {self.host_if}), "
+                f"remove or rename it, then re-run.")
+
+        ctx.warn(f"A {kind} device named '{self.host_if}' is holding the name; "
+                 "ovs-vswitchd cannot create its internal port while it exists.")
+        ctx.warn("Removing it. If something recreates it at boot -- typically a "
+                 "NetworkManager profile of that type -- delete that profile "
+                 f"too: nmcli -f NAME,TYPE,DEVICE connection show | grep {self.host_if}")
+        ctx.run("ip", "link", "del", self.host_if)
+
+    def _ensure_ovs_port(self) -> None:
+        """Create the internal port, and rebuild it if it is not working.
+
+        The old shape of this was `if port-to-br fails: add-port, else:
+        skip`. Presence of the port row is not the same thing as a working
+        interface, so once a broken row existed nothing here would ever
+        rebuild it -- setup and reconcile both re-asserted the iface-id on
+        a dead row for as long as anyone cared to re-run them.
+        """
+        ctx = self.ctx
+        exists = ctx.q("ovs-vsctl", "port-to-br", self.host_if).ok
+
+        if exists:
+            ofport, error = ovn.iface_health(ctx, self.host_if)
+            if ofport > 0:
+                ctx.log(f"OVS port {self.host_if} exists and is healthy "
+                        f"(ofport {ofport}), skipping add-port.")
+                return
+            ctx.warn(f"OVS port {self.host_if} exists but has no datapath "
+                     f"(ofport {ofport}). Rebuilding it.")
+            if error:
+                ctx.warn(f"ovs-vswitchd reports: {error}")
+            ctx.run("ovs-vsctl", "--if-exists", "del-port", self.br_int,
+                    self.host_if)
+
+        # Only now, with the OVS row gone, is a leftover device of that
+        # name unambiguously not ours to keep.
+        self._reclaim_name()
+
+        ctx.run("ovs-vsctl", "add-port", self.br_int, self.host_if,
+                "--", "set", "interface", self.host_if, "type=internal",
+                f'mac="{self.host_if_mac}"')
+
+        if ctx.dry_run:
+            return
+
+        ofport, error = ovn.iface_health(ctx, self.host_if)
+        if ofport > 0:
+            return
+        ctx.warn(f"{self.host_if} still has no datapath after being recreated "
+                 f"(ofport {ofport}).")
+        if error:
+            ctx.warn(f"ovs-vswitchd reports: {error}")
+        ctx.warn("ovn-controller cannot bind a port with no ofport, so the "
+                 "host will not reach anything through it.")
+        ctx.warn(f"-> ip -d link show {self.host_if}   (what else owns the name?)")
 
     def _kernel_mac(self) -> str:
         out = self.ctx.qout("ip", "-o", "link", "show", "dev", self.host_if)

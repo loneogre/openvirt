@@ -421,6 +421,40 @@ def _nm_profile(setup: Setup) -> str:
     return "\n".join(lines)
 
 
+# NetworkManager connection types that CREATE a kernel device rather than
+# just configuring one that already exists. A profile of one of these
+# types pointed at host-if takes the name before ovs-vswitchd can, at
+# every boot, and the OVS internal port then fails to come up with
+# "could not add network device ... (File exists)".
+NM_DEVICE_CREATING_TYPES = ("dummy", "bridge", "bond", "team", "vlan",
+                            "tun", "vxlan", "macvlan", "ip-tunnel",
+                            "ovs-interface", "ovs-port", "ovs-bridge")
+
+
+def _nm_conflicting_profiles(ctx: Ctx, iface: str, own_uuid: str) -> list[str]:
+    """NM profiles that would create a device called `iface`.
+
+    An ethernet profile only configures a device that already exists,
+    which is why this one is safe on an OVS internal port. A profile of a
+    device-creating type is not: it wins the race for the name at boot and
+    leaves the OVS port with no datapath.
+    """
+    out = ctx.qout("nmcli", "-t", "-f", "NAME,UUID,TYPE", "connection", "show")
+    found: list[str] = []
+    for line in out.splitlines():
+        parts = line.split(":")
+        if len(parts) < 3:
+            continue
+        name, prof_uuid, prof_type = parts[0], parts[1], parts[2]
+        if prof_uuid == own_uuid or prof_type not in NM_DEVICE_CREATING_TYPES:
+            continue
+        bound = ctx.qout("nmcli", "-g", "connection.interface-name",
+                         "connection", "show", prof_uuid).strip()
+        if bound == iface:
+            found.append(f"{name} ({prof_type}, {prof_uuid})")
+    return found
+
+
 def _install_nm_profile(ctx: Ctx) -> int:
     if not ctx.have("nmcli"):
         ctx.err("nmcli not found -- NetworkManager does not appear to be "
@@ -431,6 +465,30 @@ def _install_nm_profile(ctx: Ctx) -> int:
     setup = Setup(ctx)
     path = NM_PROFILE_DIR / f"{setup.host_if}.nmconnection"
     content = _nm_profile(setup)
+
+    # A profile that creates the device defeats the whole arrangement, and
+    # does so silently: everything downstream still looks configured while
+    # ovn-controller has no ofport to bind.
+    conflicts = _nm_conflicting_profiles(
+        ctx, setup.host_if, str(uuid.uuid5(uuid.NAMESPACE_DNS,
+                                           f"ovnctl.{setup.host_if}")))
+    if conflicts:
+        ctx.err(f"Another NetworkManager profile creates a device named "
+                f"'{setup.host_if}':")
+        for c in conflicts:
+            ctx.err(f"  {c}")
+        ctx.err("It will take the name at every boot and ovs-vswitchd will not "
+                "be able to create its internal port.")
+        ctx.err("Delete it first: nmcli connection delete <uuid>")
+        return 1
+
+    kind = setup._link_kind()
+    if kind and kind != "openvswitch":
+        ctx.err(f"'{setup.host_if}' is currently a {kind} device, not an OVS "
+                "internal port.")
+        ctx.err("Rebuild it before installing the profile: "
+                "ovnctl setup --only host-interface")
+        return 1
 
     if not setup.host_route_metric:
         # Two owners install these prefixes: this profile and the
