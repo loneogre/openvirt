@@ -1,0 +1,10 @@
+# Python bytecode. Regenerated on every run, including by `ovnctl` itself,
+# which puts the package on sys.path and imports it straight from the
+# checkout -- so these reappear after any command and must not be tracked.
+__pycache__/
+*.py[cod]
+
+# pip install . / build artifacts
+*.egg-info/
+build/
+dist/
