@@ -392,14 +392,25 @@ def _nm_profile(setup: Setup) -> str:
         "method=manual",
         f"address1={setup.host_if_cidr}",
     ]
+    metric = str(setup.host_route_metric).strip() if setup.host_route_metric else ""
     routes = [net for net in setup.host_routes if net.strip()]
     for n, net in enumerate(routes, start=1):
-        lines.append(f"route{n}={net},{setup.host_gw}")
-    if setup.host_route_metric:
-        # NetworkManager picks 550 for an OVS internal port -- its
-        # fallback for a device type it does not recognise as ethernet.
-        # Harmless (one route per prefix, so nothing ties) but arbitrary.
-        lines.append(f"route-metric={setup.host_route_metric}")
+        # keyfile route syntax is dest,next-hop[,metric]. Naming the
+        # metric here rather than leaning on route-metric alone keeps the
+        # number visible in the file next to the route it applies to.
+        suffix = f",{metric}" if metric else ""
+        lines.append(f"route{n}={net},{setup.host_gw}{suffix}")
+    if metric:
+        # Also covers the routes NM derives rather than reads: without
+        # this the connected route for host_if_cidr keeps NM's default of
+        # 550 while everything beside it is at the configured metric.
+        #
+        # The number matters because `ip route replace` matches on
+        # (destination, metric). setup and reconcile install the same
+        # prefixes through `ip route`, and unless both owners use the same
+        # metric neither can see -- or replace -- the other's copy, so
+        # every prefix ends up installed twice.
+        lines.append(f"route-metric={metric}")
     lines += [
         "never-default=true",
         "",
@@ -420,6 +431,17 @@ def _install_nm_profile(ctx: Ctx) -> int:
     setup = Setup(ctx)
     path = NM_PROFILE_DIR / f"{setup.host_if}.nmconnection"
     content = _nm_profile(setup)
+
+    if not setup.host_route_metric:
+        # Two owners install these prefixes: this profile and the
+        # `ip route replace` in setup/reconcile. `replace` matches on
+        # (destination, metric), so if they disagree -- NM's 550 for an
+        # OVS internal port against the kernel's 0 -- neither can replace
+        # the other and every prefix accumulates a second copy.
+        ctx.warn("[setup].host_route_metric is not set, so NetworkManager "
+                 "and `ip route` will install these routes at different "
+                 "metrics and each prefix will end up duplicated.")
+        ctx.warn("Set it (100 is a reasonable value) and re-run this.")
 
     ctx.dr_head("NetworkManager profile")
     if ctx.dry_run:
@@ -473,6 +495,12 @@ def _install_nm_profile(ctx: Ctx) -> int:
     if ctx.run("nmcli", "connection", "up", setup.host_if):
         ctx.say(f"Activated {setup.host_if}; it will come up with this address "
                 "and these routes at every boot.")
+        # Rewriting the keyfile drops any hand-added key, but routes an
+        # earlier version of it already installed in the kernel at another
+        # metric are not NM's to remove. reconcile's host-interface step
+        # deletes them.
+        ctx.say("Run `ovnctl reconcile` now to clear any copy of these "
+                "routes left in the kernel at a different metric.")
     else:
         ctx.warn(f"Could not activate {setup.host_if} now. Check: "
                  f"nmcli connection up {setup.host_if}")

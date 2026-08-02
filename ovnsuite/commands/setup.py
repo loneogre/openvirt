@@ -426,16 +426,61 @@ class Setup:
             ctx.log(f"Address {self.host_if_cidr} already assigned to "
                     f"{self.host_if}, skipping.")
 
+    def _route_metrics(self, net: str) -> list[str]:
+        """Every metric at which `net` currently exists on host_if.
+
+        A route with no metric is metric 0; report it as such so the
+        caller can compare it against a configured value.
+        """
+        found: list[str] = []
+        out = self.ctx.qout("ip", "route", "show", net, "dev", self.host_if)
+        for line in out.splitlines():
+            parts = line.split()
+            if not parts:
+                continue
+            if "metric" in parts:
+                idx = parts.index("metric")
+                if idx + 1 < len(parts):
+                    found.append(parts[idx + 1])
+                    continue
+            found.append("0")
+        return found
+
     def _add_routes(self) -> None:
         """host-if is no longer on the VM segment, so every internal
-        destination is now a routed hop via the router port."""
+        destination is now a routed hop via the router port.
+
+        `ip route replace` matches on (destination, metric), so a copy of
+        a prefix installed at any OTHER metric is invisible to it and
+        survives beside the one written here -- which is exactly what a
+        NetworkManager profile (550 by default on an OVS internal port)
+        and this function (metric 0) did to each other, one extra pair of
+        routes per prefix per reconcile. Delete the strays first, then
+        write the canonical route at the configured metric so that the
+        two paths address the same route and `replace` really replaces.
+        """
         ctx = self.ctx
+        metric = str(self.host_route_metric).strip() if self.host_route_metric else ""
+        want = metric or "0"
+
         for net in self.host_routes:
             if not net.strip():
                 continue
-            ctx.run("ip", "route", "replace", net, "via", self.host_gw,
-                    "dev", self.host_if)
-            ctx.log(f"Route {net} via {self.host_gw} dev {self.host_if}")
+
+            for existing in self._route_metrics(net):
+                if existing != want:
+                    ctx.log(f"Removing duplicate route {net} dev {self.host_if} "
+                            f"at metric {existing}.")
+                    ctx.run("ip", "route", "del", net, "dev", self.host_if,
+                            "metric", existing)
+
+            cmd = ["ip", "route", "replace", net, "via", self.host_gw,
+                   "dev", self.host_if]
+            if metric:
+                cmd += ["metric", metric]
+            ctx.run(*cmd)
+            suffix = f" metric {metric}" if metric else ""
+            ctx.log(f"Route {net} via {self.host_gw} dev {self.host_if}{suffix}")
 
     def _verify_and_report(self) -> None:
         ctx = self.ctx
