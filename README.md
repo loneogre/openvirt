@@ -62,10 +62,30 @@ not. After a reboot three things are gone and nothing puts them back:
 sudo ./ovnctl reconcile                    # reassert, report anything unsafe
 sudo ./ovnctl reconcile --repair-identity  # also delete stale chassis rows
 sudo ./ovnctl reconcile --install-unit     # run it at every boot
+sudo ./ovnctl reconcile --install-nm-profile   # persist host-if via NetworkManager
 ```
 
 `--install-unit` writes `/etc/systemd/system/ovn-reconcile.service`,
 ordered after `ovn-controller.service`, and enables it.
+
+`--install-nm-profile` covers the host-if half declaratively instead:
+it generates
+`/etc/NetworkManager/system-connections/host-if.nmconnection` from
+`[setup]` in `ovn-settings.yaml` — `host_if_ip`/`host_if_prefix` as the
+address, `host_if_mac` as the cloned MAC, and every `host_routes` entry
+as a static route via `lrp_host_cidr`. The config stays the single
+source of truth, so the profile cannot drift from what `setup` and
+`reconcile` apply. Preview it with `-n` before writing.
+
+The profile sets `never-default=true` and writes no `gateway=` key. An
+`ipv4.gateway` on host-if would install a default route through
+`lr-core` that competes with the host's real uplink on metric; the host
+reaches the VM segments through the explicit `host_routes` only.
+
+NetworkManager will not accept this profile if its OVS plugin has
+already claimed host-if as an `ovs-interface` device —
+`--install-nm-profile` detects that, says so, and tells you to use
+`--install-unit` on that host.
 
 Note that `Port_Binding.chassis` survives a reboot too, so a binding can
 name a chassis nothing is running under. `diagnose` resolves the chassis

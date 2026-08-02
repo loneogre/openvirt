@@ -28,6 +28,8 @@ nothing is wrong changes nothing.
     ovnctl -n reconcile                 preview it
     ovnctl reconcile --repair-identity  also delete stale chassis rows
     ovnctl reconcile --install-unit     run it automatically at every boot
+    ovnctl reconcile --install-nm-profile   let NetworkManager own host-if's
+                                            address and routes across reboots
 """
 
 from __future__ import annotations
@@ -35,6 +37,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from .. import identity, ovn, paths
@@ -71,6 +74,8 @@ TimeoutStartSec=120
 WantedBy=multi-user.target
 """
 
+NM_PROFILE_DIR = Path("/etc/NetworkManager/system-connections")
+
 
 def register(subparsers) -> argparse.ArgumentParser:
     p = subparsers.add_parser(NAME, help=HELP, description=__doc__,
@@ -80,6 +85,9 @@ def register(subparsers) -> argparse.ArgumentParser:
                         "identity (stops and restarts ovn-controller)")
     p.add_argument("--install-unit", action="store_true",
                    help=f"write {UNIT_PATH} and enable it, then exit")
+    p.add_argument("--install-nm-profile", action="store_true",
+                   help="write a NetworkManager keyfile so host-if's address "
+                        "and routes are reapplied at every boot, then exit")
     add_step_args(p)
     p.set_defaults(func=main)
     return p
@@ -353,12 +361,129 @@ def _install_unit(ctx: Ctx) -> int:
     return 0
 
 
+def _nm_profile(setup: Setup) -> str:
+    """A NetworkManager keyfile describing host-if's kernel-side state.
+
+    The systemd unit reapplies this state once, after boot. A keyfile
+    instead makes it a property of the interface: NetworkManager reapplies
+    it whenever the device appears, including after an ovs-vswitchd
+    restart that recreates the internal port mid-boot.
+
+    Deliberately no `gateway=`: that key installs a default route through
+    lr-core, which then competes with the host's real uplink on metric.
+    Only the configured host_routes go through the OVN router.
+    """
+    # Derived from the interface name so rewriting the file updates the
+    # existing profile rather than leaving a second one beside it.
+    profile_uuid = uuid.uuid5(uuid.NAMESPACE_DNS, f"ovnctl.{setup.host_if}")
+
+    lines = [
+        "[connection]",
+        f"id={setup.host_if}",
+        f"uuid={profile_uuid}",
+        "type=ethernet",
+        f"interface-name={setup.host_if}",
+        "autoconnect=true",
+        "",
+        "[ethernet]",
+        f"cloned-mac-address={setup.host_if_mac}",
+        "",
+        "[ipv4]",
+        "method=manual",
+        f"address1={setup.host_if_cidr}",
+    ]
+    routes = [net for net in setup.host_routes if net.strip()]
+    for n, net in enumerate(routes, start=1):
+        lines.append(f"route{n}={net},{setup.host_gw}")
+    lines += [
+        "never-default=true",
+        "",
+        "[ipv6]",
+        "method=disabled",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def _install_nm_profile(ctx: Ctx) -> int:
+    if not ctx.have("nmcli"):
+        ctx.err("nmcli not found -- NetworkManager does not appear to be "
+                "installed on this host.")
+        ctx.err("Use `ovnctl reconcile --install-unit` instead.")
+        return 1
+
+    setup = Setup(ctx)
+    path = NM_PROFILE_DIR / f"{setup.host_if}.nmconnection"
+    content = _nm_profile(setup)
+
+    ctx.dr_head("NetworkManager profile")
+    if ctx.dry_run:
+        print(f"cat > {path} <<'EOF'")
+        print(content, end="")
+        print("EOF")
+        print(f"chmod 600 {path}")
+        print("nmcli connection reload")
+        print(f"nmcli device set {setup.host_if} managed yes")
+        print(f"nmcli connection up {setup.host_if}")
+        return 0
+
+    try:
+        NM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        # NetworkManager silently ignores a keyfile that is readable by
+        # anyone but root.
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        ctx.err(f"Could not write {path}: {exc}")
+        return 1
+
+    ctx.say(f"Wrote {path}")
+    ctx.say(f"  address  {setup.host_if_cidr}")
+    for net in setup.host_routes:
+        if net.strip():
+            ctx.say(f"  route    {net} via {setup.host_gw}")
+
+    if not ctx.run("nmcli", "connection", "reload"):
+        ctx.warn("nmcli connection reload failed; the profile is on disk but "
+                 "NetworkManager has not picked it up yet.")
+        return 1
+
+    if not ctx.q("ip", "link", "show", "dev", setup.host_if).ok:
+        ctx.say(f"{setup.host_if} does not exist yet -- run `ovnctl setup "
+                "--only host-interface` to create it. NetworkManager will "
+                "apply this profile as soon as it appears.")
+        return 0
+
+    dev_type = ctx.qout("nmcli", "-g", "GENERAL.TYPE", "device", "show",
+                        setup.host_if).strip()
+    if dev_type == "ovs-interface":
+        ctx.warn(f"NetworkManager classifies {setup.host_if} as an "
+                 "ovs-interface, so it will not accept this ethernet profile.")
+        ctx.warn("That happens when NetworkManager's OVS plugin is loaded and "
+                 "reading ovsdb.")
+        ctx.warn("Use `ovnctl reconcile --install-unit` on this host instead.")
+        return 1
+
+    ctx.run("nmcli", "device", "set", setup.host_if, "managed", "yes")
+    if ctx.run("nmcli", "connection", "up", setup.host_if):
+        ctx.say(f"Activated {setup.host_if}; it will come up with this address "
+                "and these routes at every boot.")
+    else:
+        ctx.warn(f"Could not activate {setup.host_if} now. Check: "
+                 f"nmcli connection up {setup.host_if}")
+        return 1
+    return 0
+
+
 def main(ctx: Ctx, args: argparse.Namespace) -> int:
     ctx.load_config("ovn-reconcile")
     ctx.require_root()
 
     if args.install_unit:
         return _install_unit(ctx)
+
+    if args.install_nm_profile:
+        return _install_nm_profile(ctx)
 
     ctx.require_cmd("ovs-vsctl", "ovn-nbctl", "ip")
 
