@@ -78,6 +78,17 @@ setup:
     - "172.31.1.32/28"
     - "172.31.0.0/27"
 
+  # Metric for the routes in the NetworkManager profile written by
+  # `ovnctl reconcile --install-nm-profile`. Unset means "let
+  # NetworkManager choose", which for an OVS internal port is 550 --
+  # NM's fallback for a device type it does not recognise as ethernet.
+  #
+  # Nothing above depends on this. Each of these prefixes has exactly one
+  # route, and a metric only breaks ties between routes to the SAME
+  # prefix, so 550 is cosmetic. Set it when you want the numbers to be
+  # deterministic rather than a side effect of NM's device typing.
+  # host_route_metric: 100
+
   # Legacy single-route fields, still honoured if host_routes is absent.
   remote_subnet: 172.31.1.32/28
   remote_gw: 172.31.1.10

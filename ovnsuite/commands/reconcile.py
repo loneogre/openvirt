@@ -395,6 +395,11 @@ def _nm_profile(setup: Setup) -> str:
     routes = [net for net in setup.host_routes if net.strip()]
     for n, net in enumerate(routes, start=1):
         lines.append(f"route{n}={net},{setup.host_gw}")
+    if setup.host_route_metric:
+        # NetworkManager picks 550 for an OVS internal port -- its
+        # fallback for a device type it does not recognise as ethernet.
+        # Harmless (one route per prefix, so nothing ties) but arbitrary.
+        lines.append(f"route-metric={setup.host_route_metric}")
     lines += [
         "never-default=true",
         "",

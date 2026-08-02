@@ -97,6 +97,10 @@ class Setup:
         routes = c.cfg_array("setup", "host_routes")
         self.host_routes = routes if routes else [c.cfg("setup", "remote_subnet")]
 
+        # Only consulted when writing the NetworkManager profile; the
+        # `ip route` path leaves the metric to the kernel, as it always has.
+        self.host_route_metric = c.cfg_opt("setup", "host_route_metric")
+
     # -- 1 ---------------------------------------------------------------
     def external_ids(self) -> None:
         """Reconcile external-ids -- every key, every run.
